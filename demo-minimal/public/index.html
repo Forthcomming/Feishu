@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>飞书 IM Agent 最小闭环 Demo</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans",
+          "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        margin: 24px;
+        max-width: 900px;
+      }
+      textarea {
+        width: 100%;
+        height: 120px;
+      }
+      button {
+        margin-top: 12px;
+        padding: 8px 14px;
+        cursor: pointer;
+      }
+      .row {
+        margin-top: 16px;
+        display: grid;
+        grid-template-columns: 260px 1fr;
+        gap: 12px;
+        align-items: start;
+      }
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 12px;
+      }
+      .events {
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      .block {
+        margin-bottom: 14px;
+      }
+      .block-title {
+        font-weight: 700;
+        margin-bottom: 6px;
+      }
+      ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+      .muted {
+        color: #666;
+        font-size: 13px;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #f7f7f7;
+        border-radius: 8px;
+        padding: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>最小闭环：IM输入 → 生成文档 → 展示结果（Demo）</h2>
+
+    <div class="card">
+      <div class="muted">输入一段“群聊/私聊讨论文本”，点击生成后展示文档块。</div>
+      <div style="margin-top: 10px">
+        <label class="muted">用户输入</label>
+      </div>
+      <textarea id="userText">帮我把刚刚讨论整理成需求文档，并给出关键结论。我们需要明确功能范围，希望先生成需求要点，再给出总结。最后决定用 Doc/PPT 的结构化输出提升效率。</textarea>
+      <button id="btn">生成文档</button>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <div class="block-title">任务进度</div>
+        <div id="events" class="events">等待输入…</div>
+        <div class="muted" style="margin-top: 10px">事件来自后端的 TaskStateEvent 列表（含开始/细分/完成）。</div>
+      </div>
+
+      <div class="card">
+        <div class="block-title">生成结果（Document 块）</div>
+        <div id="doc"></div>
+        <div class="muted" id="docMeta" style="margin-top: 10px"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px">
+      <div class="block-title">调试输出（response JSON）</div>
+      <pre id="raw"></pre>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
+

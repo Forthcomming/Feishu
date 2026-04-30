@@ -1,0 +1,22 @@
+.DS_Store
+Thumbs.db
+
+# env / secrets
+**/.env*
+**/*.pem
+
+# dependencies
+**/node_modules/
+
+# logs
+**/*.log
+
+# build outputs
+**/.next/
+**/out/
+**/dist/
+**/build/
+**/coverage/
+
+# local tooling
+**/.vercel/
