@@ -49,7 +49,10 @@ async function fakeAiReply(userText: string) {
 function isWorkflowKeyword(text: string) {
   const t = text.trim();
   if (!t) return false;
-  return t.includes("生成PPT") || t.includes("需求文档");
+  const hasDocRef = /(?:https?:\/\/[^\s"']+\/docx\/[A-Za-z0-9]+)|(?:docx\/[A-Za-z0-9]+)/.test(t);
+  const hasSlidesRef = /(?:https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9]+)|(?:slides\/[A-Za-z0-9]+)/.test(t);
+  const wantsEdit = /(更新|修改|补充|替换|继续|第\s*\d+\s*页|页码\s*\d+)/.test(t);
+  return t.includes("生成PPT") || t.includes("需求文档") || (hasDocRef && wantsEdit) || (hasSlidesRef && wantsEdit);
 }
 
 function Bubble({ role, message }: { role: ChatRole; message: ChatMessage }) {
@@ -384,6 +387,9 @@ export default function Home() {
       if (isWorkflowKeyword(text)) {
         const deliveryChatId = process.env.NEXT_PUBLIC_DELIVERY_CHAT_ID ?? "";
         const workflowDryRun = process.env.NEXT_PUBLIC_WORKFLOW_DRY_RUN !== "false";
+        const hasDocRef = /(?:https?:\/\/[^\s"']+\/docx\/[A-Za-z0-9]+)|(?:docx\/[A-Za-z0-9]+)/.test(text);
+        const hasSlidesRef = /(?:https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9]+)|(?:slides\/[A-Za-z0-9]+)/.test(text);
+        const targetArtifacts = hasSlidesRef ? ["slides"] : hasDocRef ? ["doc"] : ["doc"];
         const resp = await fetch("/api/agent/workflow/start", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -391,7 +397,7 @@ export default function Home() {
             conversationId: "demo_conversation",
             input: text,
             contextRange: { mode: "recent_messages", limit: 20 },
-            targetArtifacts: ["doc"],
+            targetArtifacts,
             delivery: { channel: "im_chat", chatId: deliveryChatId },
             // Use bot for IM ack/delivery by default, but use user identity for docs.create to ensure you can view the doc.
             execution: { dryRun: workflowDryRun, defaultIdentity: "bot", docIdentity: "user" },

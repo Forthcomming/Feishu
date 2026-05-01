@@ -2,10 +2,18 @@ const path = require("node:path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const express = require("express");
-const { parseIntentStub } = require("./src/intentParser");
+const { parseIntent } = require("./src/intentParser");
 const { analyzeIntent } = require("./src/intentAgent");
 const { planWorkflow } = require("./src/plannerAgent");
-const { buildDocsCreateArgs, buildDocsUpdateArgs, buildImMessagesListArgs, buildImMessagesSendArgs, buildSlidesCreateArgs } = require("./src/larkCliCommands");
+const {
+  buildDocsCreateArgs,
+  buildDocsUpdateArgs,
+  buildImMessagesListArgs,
+  buildImMessagesSendArgs,
+  buildSlidesCreateArgs,
+  buildSlidesXmlPresentationsGetArgs,
+  buildSlidesXmlPresentationSlideDeleteArgs,
+} = require("./src/larkCliCommands");
 const { runLarkCli, tryParseJson } = require("./src/larkCliRunner");
 const { TaskStore } = require("./src/taskStore");
 const { AgentOrchestrator } = require("./src/orchestrator");
@@ -65,10 +73,35 @@ function looksLikeBotAck(text) {
   if (!t) return false;
   return (
     t.startsWith("已收到指令，任务已启动：") ||
+    t.startsWith("已生成NOTE：") ||
     t.startsWith("任务已完成，文档链接：") ||
     t.startsWith("任务已完成，文档已创建") ||
+    t.startsWith("任务已完成，演示稿链接：") ||
     t.startsWith("同步到飞书失败：")
   );
+}
+
+function shouldStartWorkflowFromMessage(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  // Hard gate: only start workflow when user clearly asks for a deliverable.
+  // This prevents “every message triggers a task”.
+  return (
+    /(生成|输出|整理成|写成|形成)\S{0,10}(文档|需求文档|PRD|纪要|会议纪要|方案|技术方案|报告|周报|月报|总结)/.test(t) ||
+    /(生成|输出|整理成|写成|做成)\S{0,10}(PPT|演示稿|幻灯片|slides|deck)/i.test(t) ||
+    /\b(docx|slides)\/[A-Za-z0-9]+/.test(t)
+  );
+}
+
+function isNoisyContextLine(text) {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (looksLikeBotAck(t)) return true;
+  // Filter delivery links and other auto-generated artifacts from context.
+  if (/https?:\/\/[^\s]+\/slides\/[A-Za-z0-9]+/i.test(t)) return true;
+  if (/https?:\/\/[^\s]+\/docx\/[A-Za-z0-9]+/i.test(t)) return true;
+  if (t.includes("规划产物（预览）")) return true;
+  return false;
 }
 
 function extractImTextLines(payload) {
@@ -93,7 +126,7 @@ function extractImTextLines(payload) {
     const contentRaw = obj.content;
     if ((messageType === "text" || messageType === "Text") && typeof contentRaw === "string") {
       const text = parseFeishuTextMessageContent(contentRaw);
-      if (text && !looksLikeBotAck(text)) {
+      if (text && !isNoisyContextLine(text)) {
         const createTimeRaw = obj.create_time ?? obj.createTime ?? obj.ts ?? obj.timestamp;
         const createTime = typeof createTimeRaw === "string" || typeof createTimeRaw === "number" ? Number(createTimeRaw) : NaN;
         out.push({
@@ -109,11 +142,25 @@ function extractImTextLines(payload) {
 
   // Sort by time ascending (best-effort); keep stable if no timestamps.
   out.sort((a, b) => (a.at || 0) - (b.at || 0));
-  return out.map((x) => x.text);
+  // De-duplicate identical lines while preserving order.
+  const seenText = new Set();
+  const uniq = [];
+  for (const x of out) {
+    const t = String(x.text || "").trim();
+    if (!t) continue;
+    if (seenText.has(t)) continue;
+    seenText.add(t);
+    uniq.push(t);
+  }
+  return uniq;
 }
 
 function summarizeContext(textLines) {
-  const lines = Array.isArray(textLines) ? textLines.map((s) => String(s).trim()).filter(Boolean) : [];
+  const raw = Array.isArray(textLines) ? textLines : [];
+  const lines = raw
+    .map((s) => String(s).trim())
+    .filter(Boolean)
+    .filter((s) => !isNoisyContextLine(s));
   const recent = lines.slice(-12);
   const picked = recent.slice(-8);
 
@@ -142,35 +189,6 @@ function summarizeContext(textLines) {
   return parts.join("\n");
 }
 
-function decideTargetArtifactsFromText(text) {
-  const t = String(text || "").trim();
-  const wantsPpt = /ppt|PPT|演示稿|汇报/.test(t);
-  const hasDocLink = /https?:\/\/[^\s]+\/docx\/[A-Za-z0-9]+/.test(t);
-  const explicitlyWantsDoc = /需求文档|生成文档|先写文档|整理成文档|写个文档/.test(t);
-  const basedOnDoc = /根据文档|基于文档|用文档生成|用需求文档生成/.test(t) || hasDocLink;
-
-  // Default: if user asks for PPT via natural language, generate Slides only.
-  // Only generate Doc+Slides when user explicitly asks for a doc (no doc link provided).
-  if (wantsPpt) {
-    if (basedOnDoc) return ["slides"];
-    if (explicitlyWantsDoc) return ["doc", "slides"];
-    return ["slides"];
-  }
-
-  return ["doc"];
-}
-
-function shouldTriggerWorkflowFromText(text) {
-  const t = String(text || "").trim();
-  if (!t) return false;
-  // Trigger only on explicit work keywords; ignore casual chat.
-  return (
-    /需求文档|prd|整理|梳理|总结|汇总|提炼|需求|会议纪要|行动项|待办/.test(t) ||
-    /ppt|PPT|演示稿|汇报/.test(t) ||
-    /https?:\/\/[^\s]+\/docx\/[A-Za-z0-9]+/.test(t)
-  );
-}
-
 async function publishTaskEvent(event) {
   const realtimeUrl = env("REALTIME_PUBLISH_URL", "http://localhost:3003/api/task-events");
   try {
@@ -186,11 +204,13 @@ async function publishTaskEvent(event) {
 
 const taskStore = new TaskStore();
 const orchestrator = new AgentOrchestrator({
-  parseIntentStub,
+  parseIntent,
   planWorkflow,
   buildDocsCreateArgs,
   buildDocsUpdateArgs,
   buildSlidesCreateArgs,
+  buildSlidesXmlPresentationsGetArgs,
+  buildSlidesXmlPresentationSlideDeleteArgs,
   buildImMessagesSendArgs,
   runLarkCli,
   tryParseJson,
@@ -203,20 +223,35 @@ async function fetchRecentImContext({ chatId, identities, limit }) {
   const safeLimit = typeof limit === "number" && Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.floor(limit))) : 20;
   const tries = Array.isArray(identities) && identities.length > 0 ? identities : ["bot", "user"];
   let lastError = "";
+  const tryOnce = async ({ as, omitAsFlag }) => {
+    const listArgs = omitAsFlag
+      ? ["im", "+chat-messages-list", "--chat-id", safeChatId, "--page-size", String(safeLimit), "--format", "json"]
+      : buildImMessagesListArgs({ as, chatId: safeChatId, limit: safeLimit });
+    const listResp = await runLarkCli(listArgs, { timeoutMs: 30_000 });
+    const parsed = tryParseJson(listResp.stdout);
+    if (!parsed.ok) throw new Error("messages-list returned non-json");
+    const lines = extractImTextLines(parsed.value);
+    const summary = summarizeContext(lines);
+    return { ok: true, as, lines, summary, omitAsFlag: Boolean(omitAsFlag) };
+  };
+
   for (const as of tries) {
     try {
-      const listArgs = buildImMessagesListArgs({ as, chatId: safeChatId, limit: safeLimit });
-      const listResp = await runLarkCli(listArgs, { timeoutMs: 30_000 });
-      const parsed = tryParseJson(listResp.stdout);
-      if (!parsed.ok) throw new Error("messages-list returned non-json");
-      const lines = extractImTextLines(parsed.value);
-      const summary = summarizeContext(lines);
-      return { ok: true, as, lines, summary };
+      return await tryOnce({ as, omitAsFlag: false });
     } catch (e) {
-      lastError = e && e.message ? e.message : String(e);
+      const msg = e && e.message ? e.message : String(e);
+      lastError = msg;
+      // Compatibility: some lark-cli versions don't support `--as` for shortcut commands.
+      if (String(msg).toLowerCase().includes("unknown flag: --as")) {
+        try {
+          return await tryOnce({ as, omitAsFlag: true });
+        } catch (e2) {
+          lastError = e2 && e2.message ? e2.message : String(e2);
+        }
+      }
     }
   }
-  return { ok: false, as: tries[0] || "bot", lines: [], summary: "", error: lastError };
+  return { ok: false, as: tries[0] || "bot", lines: [], summary: "", error: lastError, omitAsFlag: false };
 }
 
 app.get("/healthz", (req, res) => {
@@ -273,6 +308,7 @@ app.post("/api/feishu/events", (req, res) => {
       const text = parseFeishuTextMessageContent(contentRaw);
       if (!text) return;
       if (looksLikeBotAck(text)) return;
+      if (!shouldStartWorkflowFromMessage(text)) return;
 
       const defaultIdentity = env("FEISHU_DEFAULT_IDENTITY", "bot");
       const dryRun = env("FEISHU_DRY_RUN", env("WORKFLOW_DRY_RUN", "true")) !== "false";
@@ -280,12 +316,14 @@ app.post("/api/feishu/events", (req, res) => {
       // Pull recent context (best effort). If it fails, still run with raw input.
       let contextBlock = "";
       let contextSummary = "";
+      let recentMessages = [];
       try {
         const listArgs = buildImMessagesListArgs({ as: defaultIdentity, chatId, limit: 20 });
         const listResp = await runLarkCli(listArgs, { timeoutMs: 30_000 });
         const parsed = tryParseJson(listResp.stdout);
         if (parsed.ok) {
           const lines = extractImTextLines(parsed.value);
+          recentMessages = lines.slice(-20);
           const summary = summarizeContext(lines);
           contextSummary = summary;
           const quotes = lines
@@ -298,8 +336,8 @@ app.post("/api/feishu/events", (req, res) => {
         // ignore
       }
 
-      const intent = await analyzeIntent({ text, contextSummary });
-      const threshold = Number(intent?.threshold ?? 0.65);
+      const intent = await analyzeIntent({ text, contextSummary, recentMessages });
+      const threshold = Number(intent?.thresholds?.slow ?? 0.6);
       const confident = intent?.intent?.name !== "unknown" && (intent?.intent?.confidence ?? 0) >= threshold;
       if (!confident) return;
 
@@ -324,8 +362,9 @@ app.post("/api/feishu/events", (req, res) => {
           conversationId: chatId,
           input: `${text}${contextBlock}`,
           contextSummary,
+          recentMessages,
           contextRange: { mode: "recent_messages", limit: 20 },
-          targetArtifacts: Array.isArray(intent?.slots?.targetArtifacts) ? intent.slots.targetArtifacts : decideTargetArtifactsFromText(text),
+          targetArtifacts: Array.isArray(intent?.slots?.targetArtifacts) ? intent.slots.targetArtifacts : ["doc"],
           delivery: { channel: "im_chat", chatId },
           execution: { dryRun, defaultIdentity, docIdentity: "user", slidesIdentity: "user" },
         });
@@ -350,7 +389,7 @@ app.post("/api/feishu/events", (req, res) => {
   })();
 });
 
-app.post("/api/agent/parse-intent", (req, res) => {
+app.post("/api/agent/parse-intent", async (req, res) => {
   try {
     const body = req.body || {};
     const inputRaw =
@@ -402,7 +441,10 @@ app.post("/api/agent/parse-intent", (req, res) => {
       },
     ];
 
-    const result = parseIntentStub({ input });
+    const contextSummary = typeof body.contextSummary === "string" ? body.contextSummary.trim() : "";
+    const recentMessages = Array.isArray(body.recentMessages) ? body.recentMessages : [];
+    const resolved = await analyzeIntent({ text: input, contextSummary, recentMessages });
+    const result = resolved?.parseIntentV2 || parseIntent(input, { contextSummary, recentMessages });
 
     res.json({
       task: {
@@ -414,6 +456,9 @@ app.post("/api/agent/parse-intent", (req, res) => {
       },
       events,
       result,
+      source: resolved?.source || "rule",
+      decisionPath: resolved?.decisionPath || "fast",
+      thresholds: resolved?.thresholds || { fast: 0.8, slow: 0.6 },
     });
   } catch (e) {
     res.status(500).json({ error: e && e.message ? e.message : String(e) });
@@ -440,6 +485,7 @@ app.post("/api/agent/workflow/start", async (req, res) => {
     const execution = body.execution || { dryRun: true, defaultIdentity: "user" };
     const delivery = body.delivery || { channel: "im_chat", chatId: "" };
     let contextSummary = typeof body.contextSummary === "string" ? body.contextSummary.trim() : "";
+    let recentMessages = Array.isArray(body.recentMessages) ? body.recentMessages : [];
     let enrichedInput = input;
     let contextDebug = { enriched: false, usedChatId: "", usedIdentity: "", lines: 0, error: "" };
     try {
@@ -461,6 +507,7 @@ app.post("/api/agent/workflow/start", async (req, res) => {
         contextDebug.lines = Array.isArray(ctx.lines) ? ctx.lines.length : 0;
         contextDebug.error = ctx.ok ? "" : ctx.error || "";
         if (ctx.ok && ctx.lines.length > 0) {
+          recentMessages = ctx.lines.slice(-limit);
           const summary = ctx.summary;
           if (!contextSummary) contextSummary = summary;
           const quotes = ctx.lines
@@ -479,13 +526,21 @@ app.post("/api/agent/workflow/start", async (req, res) => {
     }
 
     const taskId = getId("task");
+    const explicitArtifacts = Array.isArray(body.targetArtifacts) ? body.targetArtifacts : null;
+    const resolvedIntent = explicitArtifacts ? null : await analyzeIntent({ text: input, contextSummary, recentMessages });
+    const inferredArtifacts = Array.isArray(resolvedIntent?.slots?.targetArtifacts)
+      ? resolvedIntent.slots.targetArtifacts
+      : resolvedIntent?.parseIntentV2?.output_type === "ppt"
+        ? ["slides"]
+        : ["doc"];
     const task = await orchestrator.startWorkflow({
       taskId,
       conversationId,
       input: enrichedInput,
       contextSummary,
+      recentMessages,
       contextRange,
-      targetArtifacts: Array.isArray(body.targetArtifacts) ? body.targetArtifacts : ["doc"],
+      targetArtifacts: explicitArtifacts || inferredArtifacts,
       delivery,
       execution,
     });
@@ -499,6 +554,14 @@ app.post("/api/agent/workflow/start", async (req, res) => {
       },
       subscribe: { channel: `task:${task.taskId}` },
       contextDebug,
+      intentDebug: resolvedIntent
+        ? {
+            source: resolvedIntent.source,
+            decisionPath: resolvedIntent.decisionPath,
+            confidence: resolvedIntent.intent?.confidence ?? 0,
+            thresholds: resolvedIntent.thresholds || { fast: 0.8, slow: 0.6 },
+          }
+        : null,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e && e.message ? e.message : String(e) });
@@ -515,11 +578,14 @@ app.post("/api/agent/workflow/plan", async (req, res) => {
       return;
     }
     const contextSummary = typeof body.contextSummary === "string" ? body.contextSummary.trim() : "";
-    const targetArtifacts = Array.isArray(body.targetArtifacts) ? body.targetArtifacts : ["doc"];
+    const recentMessages = Array.isArray(body.recentMessages) ? body.recentMessages : [];
+    const explicitArtifacts = Array.isArray(body.targetArtifacts) ? body.targetArtifacts : null;
+    const resolvedIntent = await analyzeIntent({ text: input, contextSummary, recentMessages });
+    const targetArtifacts = explicitArtifacts || (Array.isArray(resolvedIntent?.slots?.targetArtifacts) ? resolvedIntent.slots.targetArtifacts : ["doc"]);
     const execution = body.execution && typeof body.execution === "object" ? body.execution : { dryRun: true, defaultIdentity: "bot" };
 
     const taskId = getId("taskplan");
-    const intent = parseIntentStub({ input });
+    const intent = resolvedIntent?.parseIntentV2 || parseIntent(input, { contextSummary, recentMessages });
     const plan = await planWorkflow({ text: input, contextSummary, intent, targetArtifacts, execution });
 
     res.json({
@@ -529,6 +595,12 @@ app.post("/api/agent/workflow/plan", async (req, res) => {
         planVersion: plan.planVersion,
         risks: plan.risks || { needsConfirm: false, reason: "" },
         steps: Array.isArray(plan.steps) ? plan.steps.map((s) => ({ stepId: s.stepId, label: s.label, status: s.status || "pending" })) : [],
+      },
+      intentDebug: {
+        source: resolvedIntent?.source || "rule",
+        decisionPath: resolvedIntent?.decisionPath || "fast",
+        confidence: resolvedIntent?.intent?.confidence ?? 0,
+        thresholds: resolvedIntent?.thresholds || { fast: 0.8, slow: 0.6 },
       },
     });
   } catch (e) {

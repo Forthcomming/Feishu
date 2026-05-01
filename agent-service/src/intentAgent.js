@@ -1,4 +1,5 @@
-const { parseIntentStub } = require("./intentParser");
+const { parseIntent, normalizeIntentOutput } = require("./intentParser");
+const { callChatCompletions } = require("./llmChat");
 
 function envOptional(name) {
   const v = process.env[name];
@@ -12,104 +13,83 @@ function clamp01(n) {
   return n;
 }
 
-function normalizeTaskType(taskType) {
-  const t = String(taskType || "").toLowerCase().trim();
-  if (t === "doc" || t === "document") return "doc";
-  if (t === "slides" || t === "ppt" || t === "presentation") return "slides";
-  if (t === "summary" || t === "summarize") return "summary";
-  return "unknown";
-}
-
 function extractDocUrl(text) {
   const m = String(text || "").match(/https?:\/\/[^\s]+\/docx\/[A-Za-z0-9]+/);
   return m ? m[0] : "";
 }
 
-function mapStubToIntentResult(stub) {
-  const name = stub?.intent?.name;
-  const confidence = clamp01(Number(stub?.intent?.confidence ?? 0));
-  const outputKinds = Array.isArray(stub?.slots?.outputKinds) ? stub.slots.outputKinds : [];
+function extractSlidesUrl(text) {
+  const m = String(text || "").match(/https?:\/\/[^\s]+\/slides\/[A-Za-z0-9]+/);
+  return m ? m[0] : "";
+}
 
-  let taskType = "unknown";
-  if (name === "generate_review_ppt") taskType = "slides";
-  else if (name === "generate_requirements_doc") taskType = "doc";
-  else if (name === "summarize_conversation") taskType = "summary";
+function extractSlidesPageIndex(text) {
+  const s = String(text || "");
+  const m1 = s.match(/第\s*(\d{1,3})\s*页/);
+  const m2 = s.match(/页码\s*(\d{1,3})/);
+  const m3 = s.match(/\bpage\s*(\d{1,3})\b/i);
+  const raw = (m1 && m1[1]) || (m2 && m2[1]) || (m3 && m3[1]) || "";
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  const idx = Math.max(1, Math.min(200, Math.floor(n)));
+  return idx;
+}
 
-  const wantsDoc = outputKinds.includes("doc") || taskType === "doc";
-  const wantsSlides = outputKinds.includes("ppt") || taskType === "slides";
-  const targetArtifacts = wantsSlides ? (wantsDoc ? ["doc", "slides"] : ["slides"]) : ["doc"];
-
+function mapParsedIntentToWorkflow(parsed) {
+  const normalized = normalizeIntentOutput(parsed);
+  const taskType = normalized.output_type === "ppt" ? "slides" : "doc";
+  const targetArtifacts = normalized.output_type === "ppt" ? ["slides"] : ["doc"];
   return {
-    source: "stub",
-    intent: { name: taskType, confidence },
+    intent: { name: taskType, confidence: clamp01(Number(normalized.confidence ?? 0)) },
     slots: {
       targetArtifacts,
       basedOnDocUrl: "",
+      basedOnSlidesUrl: "",
+      slidesEditPageIndex: null,
       contextRange: { mode: "recent_messages", limit: 20 },
-      needClarify: taskType === "unknown" || confidence < 0.65,
+      needClarify: false,
       clarifyQuestion: "我没完全理解你的需求。你想生成：1) 需求文档 2) 演示稿PPT 3) 总结？回复 1/2/3。",
+      parseIntentV2: normalized,
     },
   };
 }
 
-async function callDoubaoIntent({ text, contextSummary, timeoutMs }) {
-  const apiKey = envOptional("DOUBAO_API_KEY");
-  const baseUrl = envOptional("DOUBAO_BASE_URL") ?? "https://ark.cn-beijing.volces.com/api/v3";
-  const endpointId = envOptional("DOUBAO_ENDPOINT_ID");
-  if (!apiKey || !endpointId) {
-    throw new Error("missing DOUBAO_API_KEY or DOUBAO_ENDPOINT_ID");
-  }
+function hasExplicitTypeHint(text, parsed) {
+  if (parsed?.meta?.explicitTypeHit === true) return true;
+  const s = String(text || "").toLowerCase();
+  return /ppt|演示稿|幻灯片|prd|需求文档|会议纪要|技术方案|方案|汇报|报告|头脑风暴/.test(s);
+}
 
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const system = [
-      "你是一个意图理解器（IntentAgent）。",
-      "请仅输出严格 JSON（不要代码块，不要多余解释）。",
-      "根据用户输入与上下文，判断 task_type 与 target_artifacts。",
-      '输出 schema: {"task_type":"doc|slides|summary|unknown","confidence":0-1,"target_artifacts":["doc"|"slides"],"based_on_doc_url":"","need_clarify":true|false,"clarify_question":""}',
-      "规则：",
-      "- 用户要求PPT/演示稿/汇报 -> task_type=slides，target_artifacts默认仅slides",
-      "- 用户明确要求需求文档/文档整理 -> task_type=doc",
-      "- 用户要求总结/结论/提炼 -> task_type=summary",
-      "- 若用户说“文档+PPT”，target_artifacts为[\"doc\",\"slides\"]",
-      "- 若用户提供docx链接或说“基于文档生成PPT”，based_on_doc_url填该链接，target_artifacts仅slides",
-      "- 若无法确定，task_type=unknown，need_clarify=true，并给出clarify_question（让用户选1文档2PPT3总结）。",
-    ].join("\n");
+function readThresholds() {
+  const fast = Number(envOptional("INTENT_FAST_THRESHOLD") ?? "0.8");
+  const slow = Number(envOptional("INTENT_SLOW_THRESHOLD") ?? "0.6");
+  const fastThreshold = Number.isFinite(fast) ? Math.min(1, Math.max(0, fast)) : 0.8;
+  const slowThreshold = Number.isFinite(slow) ? Math.min(1, Math.max(0, slow)) : 0.6;
+  const normalizedSlow = Math.min(slowThreshold, fastThreshold);
+  return { fastThreshold, slowThreshold: normalizedSlow };
+}
 
-    const user = [
-      `用户输入：${String(text || "").trim()}`,
-      `上下文摘要：${String(contextSummary || "").trim()}`,
-    ].join("\n");
+async function callLlmIntent({ text, contextSummary, recentMessages, rulePreview, timeoutMs }) {
+  const system = [
+    "你是一个意图理解器（IntentAgent）。",
+    "请仅输出严格 JSON（不要代码块，不要多余解释）。",
+    "请先判断场景，再判断输出类型与子类型。",
+    '输出 schema: {"output_type":"doc|ppt","doc_type":"prd|meeting_summary|solution|report|brainstorm","ppt_type":"review|report|proposal","scenario":"discussion|review|handoff|brainstorm","confidence":0-1,"reasoning":""}',
+    "规则：",
+    "- 先做 scenario 分类，再推导 output_type 与 doc_type/ppt_type",
+    "- 若用户表达“整理一下”：结合上下文判断为 prd/meeting_summary/solution",
+    "- 若无法判断，必须回退 output_type=doc 且 doc_type=meeting_summary",
+    "- 输出必须稳定，不要输出随机描述，reasoning 控制在1-2句",
+  ].join("\n");
 
-    const resp = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: endpointId,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        temperature: 0,
-      }),
-      signal: controller.signal,
-    });
+  const user = [
+    `用户输入：${String(text || "").trim()}`,
+    `上下文摘要：${String(contextSummary || "").trim()}`,
+    `最近消息：${Array.isArray(recentMessages) ? recentMessages.slice(-12).join(" | ") : ""}`,
+    `规则预判：${JSON.stringify(rulePreview || {})}`,
+  ].join("\n");
 
-    const raw = await resp.text();
-    if (!resp.ok) throw new Error(raw || `doubao http ${resp.status}`);
-
-    // Volc Ark chat.completions is OpenAI-like: { choices:[{message:{content}}] }
-    const parsed = JSON.parse(raw);
-    const content = parsed?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || !content.trim()) throw new Error("doubao returned empty content");
-    return content.trim();
-  } finally {
-    clearTimeout(t);
-  }
+  return callChatCompletions({ system, user, temperature: 0, timeoutMs, purpose: "intent" });
 }
 
 function parseIntentJson(s) {
@@ -120,56 +100,89 @@ function parseIntentJson(s) {
   const body = text.slice(jsonStart, jsonEnd + 1);
   const obj = JSON.parse(body);
 
-  const taskType = normalizeTaskType(obj.task_type);
-  const confidence = clamp01(Number(obj.confidence ?? 0));
-  const artifactsRaw = Array.isArray(obj.target_artifacts) ? obj.target_artifacts : [];
-  const targetArtifacts = artifactsRaw
-    .map((x) => normalizeTaskType(x))
-    .filter((x) => x === "doc" || x === "slides");
-  const uniq = Array.from(new Set(targetArtifacts));
-  const basedOnDocUrl = typeof obj.based_on_doc_url === "string" ? obj.based_on_doc_url.trim() : "";
-  const needClarify = obj.need_clarify === true || taskType === "unknown" || confidence < 0.65;
-  const clarifyQuestion =
-    typeof obj.clarify_question === "string" && obj.clarify_question.trim()
-      ? obj.clarify_question.trim()
-      : "我没完全理解你的需求。你想生成：1) 需求文档 2) 演示稿PPT 3) 总结？回复 1/2/3。";
-
-  const finalArtifacts = uniq.length > 0 ? uniq : taskType === "slides" ? ["slides"] : taskType === "summary" ? ["doc"] : ["doc"];
-  return {
-    intent: { name: taskType, confidence },
-    slots: {
-      targetArtifacts: finalArtifacts,
-      basedOnDocUrl: basedOnDocUrl || extractDocUrl(text),
-      contextRange: { mode: "recent_messages", limit: 20 },
-      needClarify,
-      clarifyQuestion,
-    },
-  };
+  return normalizeIntentOutput(obj);
 }
 
-async function analyzeIntent({ text, contextSummary }) {
+async function resolveIntent({ text, contextSummary, recentMessages }) {
   const timeoutMs = Number(envOptional("INTENT_TIMEOUT_MS") ?? "6000");
-  const threshold = Number(envOptional("INTENT_CONFIDENCE_THRESHOLD") ?? "0.65");
+  const { fastThreshold, slowThreshold } = readThresholds();
+  const ruleParsed = parseIntent(text, { contextSummary, recentMessages });
+  const mappedRule = mapParsedIntentToWorkflow(ruleParsed);
+  const explicitTypeHit = hasExplicitTypeHint(text, ruleParsed);
+  const ruleConfidence = clamp01(Number(ruleParsed.confidence ?? 0));
+  let decisionPath = "slow";
+  if (ruleConfidence >= fastThreshold) decisionPath = "fast";
+  else if (ruleConfidence >= slowThreshold) decisionPath = explicitTypeHit ? "hybrid_fast" : "hybrid_slow";
+  else decisionPath = "slow";
 
-  // If no Doubao config, go stub directly.
-  const hasDoubao = Boolean(envOptional("DOUBAO_API_KEY") && envOptional("DOUBAO_ENDPOINT_ID"));
-  if (!hasDoubao) {
-    const stub = parseIntentStub({ input: text });
-    const mapped = mapStubToIntentResult(stub);
-    return { ...mapped, threshold };
+  const shouldUseRule = decisionPath === "fast" || decisionPath === "hybrid_fast";
+  const hasAnyLlm = Boolean(envOptional("DOUBAO_API_KEY") || envOptional("DEEPSEEK_API_KEY"));
+  if (!hasAnyLlm || shouldUseRule) {
+    const needClarify = ruleConfidence < slowThreshold;
+    const source = !hasAnyLlm ? "rule_no_llm" : "rule";
+    return {
+      source,
+      decisionPath: shouldUseRule ? decisionPath : "slow_fallback",
+      parseIntentV2: normalizeIntentOutput(ruleParsed),
+      ...mappedRule,
+      thresholds: { fast: fastThreshold, slow: slowThreshold },
+      slots: {
+        ...mappedRule.slots,
+        basedOnDocUrl: extractDocUrl(text),
+        basedOnSlidesUrl: extractSlidesUrl(text),
+        slidesEditPageIndex: extractSlidesPageIndex(text),
+        needClarify,
+      },
+    };
   }
 
   try {
-    const content = await callDoubaoIntent({ text, contextSummary, timeoutMs });
-    const parsed = parseIntentJson(content);
-    const needClarify = parsed.slots.needClarify === true || parsed.intent.confidence < threshold || parsed.intent.name === "unknown";
-    return { source: "doubao", ...parsed, threshold, slots: { ...parsed.slots, needClarify } };
+    const content = await callLlmIntent({
+      text,
+      contextSummary,
+      recentMessages,
+      rulePreview: ruleParsed,
+      timeoutMs,
+    });
+    const llmParsed = parseIntentJson(content);
+    const llmMapped = mapParsedIntentToWorkflow(llmParsed);
+    const llmConfidence = clamp01(Number(llmMapped.intent.confidence ?? 0));
+    const needClarify = llmConfidence < slowThreshold;
+    return {
+      source: "llm",
+      decisionPath,
+      parseIntentV2: normalizeIntentOutput(llmParsed),
+      ...llmMapped,
+      thresholds: { fast: fastThreshold, slow: slowThreshold },
+      slots: {
+        ...llmMapped.slots,
+        basedOnDocUrl: extractDocUrl(text),
+        basedOnSlidesUrl: extractSlidesUrl(text),
+        slidesEditPageIndex: extractSlidesPageIndex(text),
+        needClarify,
+      },
+    };
   } catch {
-    const stub = parseIntentStub({ input: text });
-    const mapped = mapStubToIntentResult(stub);
-    return { ...mapped, threshold };
+    return {
+      source: "rule",
+      decisionPath: "slow_fallback",
+      parseIntentV2: normalizeIntentOutput(ruleParsed),
+      ...mappedRule,
+      thresholds: { fast: fastThreshold, slow: slowThreshold },
+      slots: {
+        ...mappedRule.slots,
+        basedOnDocUrl: extractDocUrl(text),
+        basedOnSlidesUrl: extractSlidesUrl(text),
+        slidesEditPageIndex: extractSlidesPageIndex(text),
+        needClarify: true,
+      },
+    };
   }
 }
 
-module.exports = { analyzeIntent };
+async function analyzeIntent(args) {
+  return resolveIntent(args);
+}
+
+module.exports = { analyzeIntent, resolveIntent };
 

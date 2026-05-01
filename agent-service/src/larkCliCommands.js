@@ -25,8 +25,9 @@ function buildImMessagesListArgs({ as, chatId, limit }) {
   const identity = assertEnum("as", as ?? "bot", ["bot", "user"]);
   const safeChatId = assertString("chatId", chatId, { maxLen: 128 });
   const safeLimit = typeof limit === "number" && Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.floor(limit))) : 20;
+  // Compatibility: lark-cli v1.0.x uses `im +chat-messages-list` with `--page-size`.
   // Keep args minimal; list should be read-only and safe by default.
-  return ["im", "+messages-list", "--as", identity, "--chat-id", safeChatId, "--limit", String(safeLimit), "--format", "json"];
+  return ["im", "+chat-messages-list", "--as", identity, "--chat-id", safeChatId, "--page-size", String(safeLimit), "--format", "json"];
 }
 
 function buildDocsCreateArgs({ as, title, markdown, apiVersion, dryRun }) {
@@ -94,5 +95,48 @@ function buildSlidesCreateArgs({ as, title, slidesXmlArray, dryRun }) {
   return args;
 }
 
-module.exports = { buildImMessagesSendArgs, buildImMessagesListArgs, buildDocsCreateArgs, buildDocsUpdateArgs, buildSlidesCreateArgs };
+function buildSlidesXmlPresentationsGetArgs({ as, xmlPresentationId, dryRun }) {
+  const identity = assertEnum("as", as ?? "user", ["bot", "user"]);
+  const safeId = assertString("xmlPresentationId", xmlPresentationId, { maxLen: 128 });
+  // Native API call. Keep args minimal (some cli builds don't support --format on native calls).
+  const args = [
+    "slides",
+    "xml_presentations",
+    "get",
+    "--as",
+    identity,
+    "--params",
+    JSON.stringify({ xml_presentation_id: safeId }),
+  ];
+  if (dryRun !== false) args.push("--dry-run");
+  return args;
+}
+
+function buildSlidesXmlPresentationSlideDeleteArgs({ as, xmlPresentationId, slideId, dryRun }) {
+  const identity = assertEnum("as", as ?? "user", ["bot", "user"]);
+  const safeXmlId = assertString("xmlPresentationId", xmlPresentationId, { maxLen: 128 });
+  const safeSlideId = assertString("slideId", slideId, { maxLen: 128 });
+  const args = [
+    "slides",
+    "xml_presentation.slide",
+    "delete",
+    "--as",
+    identity,
+    "--params",
+    JSON.stringify({ xml_presentation_id: safeXmlId, slide_id: safeSlideId }),
+    "--yes",
+  ];
+  if (dryRun !== false) args.push("--dry-run");
+  return args;
+}
+
+module.exports = {
+  buildImMessagesSendArgs,
+  buildImMessagesListArgs,
+  buildDocsCreateArgs,
+  buildDocsUpdateArgs,
+  buildSlidesCreateArgs,
+  buildSlidesXmlPresentationsGetArgs,
+  buildSlidesXmlPresentationSlideDeleteArgs,
+};
 
