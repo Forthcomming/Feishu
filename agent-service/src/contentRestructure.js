@@ -27,6 +27,27 @@ function dedupeKeepOrder(lines, { max = 200 } = {}) {
 function isNoisyLine(line) {
   const s = normalizeLine(line);
   if (!s) return true;
+  // Placeholder lines should not be treated as facts.
+  if (s === "（暂无）" || s === "暂无" || s === "待补充" || s === "（待补充）" || s === "待定" || s === "（待定）") return true;
+  // Common section labels that often pollute extracted bullets.
+  if (
+    s === "上文摘要" ||
+    s === "上下文摘要" ||
+    s === "关键要点" ||
+    s === "要点" ||
+    s === "事实要点" ||
+    s === "决策/结论" ||
+    s === "决策" ||
+    s === "结论" ||
+    s === "行动项" ||
+    s === "待决问题" ||
+    s === "待确认问题" ||
+    s === "澄清清单" ||
+    s === "约束/范围" ||
+    s === "风险" ||
+    s === "风险点"
+  )
+    return true;
   // Strip injected quote blocks and meta.
   if (s.startsWith(">")) return true;
   if (/^\[invalid text json\]$/i.test(s)) return true;
@@ -315,9 +336,16 @@ function restructureContent({ text, contextSummary, intent, bundle, targetArtifa
   const scenario = typeof intent?.scenario === "string" ? intent.scenario : "";
   const outlineHeadings = extractUserOutlineFromText(text);
 
+  const templateHeadings = templateHeadingsFromIntent(intent);
+  const outlineSet = new Set(
+    dedupeKeepOrder([...(Array.isArray(outlineHeadings) ? outlineHeadings : []), ...(Array.isArray(templateHeadings) ? templateHeadings : [])], { max: 40 }),
+  );
+
   const candidates = collectCandidateLines({ text, contextSummary, bundle })
     .map(normalizeLine)
     .filter((l) => l && !isNoisyLine(l))
+    // Drop outline headings themselves to avoid polluting facts.
+    .filter((l) => !outlineSet.has(l))
     // drop headings-only lines
     .filter((l) => !/^(任务指令|意图|执行计划|Planner|结构大纲|上下文摘要|关键要点|需求点|待确认问题|行动项|决策\/结论|决策|结论)\b/.test(l));
 
@@ -352,8 +380,6 @@ function restructureContent({ text, contextSummary, intent, bundle, targetArtifa
   cleaned.constraints = tighten(cleaned.constraints);
   cleaned.risks = tighten(cleaned.risks);
   cleaned.facts = tighten(cleaned.facts);
-
-  const templateHeadings = templateHeadingsFromIntent(intent);
 
   const meta = {
     outputType,

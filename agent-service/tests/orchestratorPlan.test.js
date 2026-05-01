@@ -30,6 +30,19 @@ function makeDeps({ events }) {
         restructuredMd: "## 元信息\n- 产物：文档\n\n## 背景与目标\n- （测试要点）\n\n## 风险\n- （测试要点）",
         docOutlineMd: wantsDoc ? "## 结构大纲（可编辑）\n- 背景与目标\n- 方案概述\n- 风险与权衡\n- 里程碑与回滚预案" : "",
         pptOutlineLines: wantsSlides ? ["背景与目标", "方案要点", "风险与待确认", "里程碑与下一步"] : [],
+        rewrittenSlidesPlan: wantsSlides
+          ? {
+              confidence: 0.8,
+              slides: [
+                { title: "提案演示稿（封面）", bullets: ["目标与范围", "关键方案", "风险与里程碑"] },
+                { title: "机会与目标", bullets: ["当前问题概述", "目标指标与收益", "适用范围与边界"] },
+                { title: "提案概述", bullets: ["整体思路", "关键能力清单", "交互/流程要点"] },
+                { title: "实施方案", bullets: ["模块拆分", "关键接口与依赖", "落地路径"] },
+                { title: "风险与备选", bullets: ["主要风险", "缓解措施", "回滚/兜底"] },
+                { title: "需要决策/支持", bullets: ["关键假设确认", "资源与排期确认", "评审结论与下一步"] },
+              ],
+            }
+          : undefined,
         cleaned: {
           facts: ["（测试）"],
           decisions: [],

@@ -443,7 +443,7 @@ class AgentOrchestrator {
             if (t.length <= max) return t;
             return `${t.slice(0, max - 3)}...`;
           };
-          const structured = safe(contentBundle.rewrittenMd || contentBundle.restructuredMd, 2600);
+          const structured = safe(contentBundle.rewrittenMd, 2600);
           const summary = safe(contentBundle.summaryMd, 1200);
           const reqs = safe(contentBundle.requirementsMd, 1200);
           const clarify = safe(contentBundle.clarifyMd, 900);
@@ -521,10 +521,9 @@ class AgentOrchestrator {
           const clarifyMd = b?.clarifyMd ? String(b.clarifyMd).trim() : "";
           const outlineMd = b?.outlineMd ? String(b.outlineMd).trim() : "";
           const rewrittenMd = b?.rewrittenMd ? String(b.rewrittenMd).trim() : "";
-          const restructuredMd = b?.restructuredMd ? String(b.restructuredMd).trim() : "";
           const docTpl = resolveDocTemplate(intent);
           const fallbackBody = [summaryMd, requirementsMd, clarifyMd, outlineMd].filter(Boolean).join("\n\n").trim();
-          const bodyMd = rewrittenMd || restructuredMd || fallbackBody || "## 内容\n- （暂无）";
+          const bodyMd = rewrittenMd || fallbackBody || "## 内容\n- （暂无）";
           const docMarkdown = ["# " + docTpl.h1, "", bodyMd].join("\n\n");
           const docTarget = pickDocTargetFromInput(input.input);
           const canUpdate = Boolean(docTarget && typeof this.buildDocsUpdateArgs === "function");

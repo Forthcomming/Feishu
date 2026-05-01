@@ -13,6 +13,11 @@ function clamp01(n) {
   return n;
 }
 
+function readSlowThresholdForApi() {
+  const slow = Number(envOptional("INTENT_SLOW_THRESHOLD") ?? "0.6");
+  return Number.isFinite(slow) ? Math.min(1, Math.max(0, slow)) : 0.6;
+}
+
 function extractDocUrl(text) {
   const m = String(text || "").match(/https?:\/\/[^\s]+\/docx\/[A-Za-z0-9]+/);
   return m ? m[0] : "";
@@ -54,21 +59,6 @@ function mapParsedIntentToWorkflow(parsed) {
   };
 }
 
-function hasExplicitTypeHint(text, parsed) {
-  if (parsed?.meta?.explicitTypeHit === true) return true;
-  const s = String(text || "").toLowerCase();
-  return /ppt|演示稿|幻灯片|prd|需求文档|会议纪要|技术方案|方案|汇报|报告|头脑风暴/.test(s);
-}
-
-function readThresholds() {
-  const fast = Number(envOptional("INTENT_FAST_THRESHOLD") ?? "0.8");
-  const slow = Number(envOptional("INTENT_SLOW_THRESHOLD") ?? "0.6");
-  const fastThreshold = Number.isFinite(fast) ? Math.min(1, Math.max(0, fast)) : 0.8;
-  const slowThreshold = Number.isFinite(slow) ? Math.min(1, Math.max(0, slow)) : 0.6;
-  const normalizedSlow = Math.min(slowThreshold, fastThreshold);
-  return { fastThreshold, slowThreshold: normalizedSlow };
-}
-
 async function callLlmIntent({ text, contextSummary, recentMessages, rulePreview, timeoutMs }) {
   const system = [
     "你是一个意图理解器（IntentAgent）。",
@@ -77,7 +67,6 @@ async function callLlmIntent({ text, contextSummary, recentMessages, rulePreview
     '输出 schema: {"output_type":"doc|ppt","doc_type":"prd|meeting_summary|solution|report|brainstorm","ppt_type":"review|report|proposal","scenario":"discussion|review|handoff|brainstorm","confidence":0-1,"reasoning":""}',
     "规则：",
     "- 先做 scenario 分类，再推导 output_type 与 doc_type/ppt_type",
-    "- 若用户表达“整理一下”：结合上下文判断为 prd/meeting_summary/solution",
     "- 若无法判断，必须回退 output_type=doc 且 doc_type=meeting_summary",
     "- 输出必须稳定，不要输出随机描述，reasoning 控制在1-2句",
   ].join("\n");
@@ -105,33 +94,46 @@ function parseIntentJson(s) {
 
 async function resolveIntent({ text, contextSummary, recentMessages }) {
   const timeoutMs = Number(envOptional("INTENT_TIMEOUT_MS") ?? "6000");
-  const { fastThreshold, slowThreshold } = readThresholds();
+  const slowThreshold = readSlowThresholdForApi();
+  const thresholds = { fast: 0.8, slow: slowThreshold };
+
   const ruleParsed = parseIntent(text, { contextSummary, recentMessages });
   const mappedRule = mapParsedIntentToWorkflow(ruleParsed);
-  const explicitTypeHit = hasExplicitTypeHint(text, ruleParsed);
-  const ruleConfidence = clamp01(Number(ruleParsed.confidence ?? 0));
-  let decisionPath = "slow";
-  if (ruleConfidence >= fastThreshold) decisionPath = "fast";
-  else if (ruleConfidence >= slowThreshold) decisionPath = explicitTypeHit ? "hybrid_fast" : "hybrid_slow";
-  else decisionPath = "slow";
+  const slotExtras = {
+    basedOnDocUrl: extractDocUrl(text),
+    basedOnSlidesUrl: extractSlidesUrl(text),
+    slidesEditPageIndex: extractSlidesPageIndex(text),
+  };
 
-  const shouldUseRule = decisionPath === "fast" || decisionPath === "hybrid_fast";
+  const hasShortcut = ruleParsed?.meta?.explicitTypeHit === true;
   const hasAnyLlm = Boolean(envOptional("DOUBAO_API_KEY") || envOptional("DEEPSEEK_API_KEY"));
-  if (!hasAnyLlm || shouldUseRule) {
-    const needClarify = ruleConfidence < slowThreshold;
-    const source = !hasAnyLlm ? "rule_no_llm" : "rule";
+
+  if (hasShortcut) {
     return {
-      source,
-      decisionPath: shouldUseRule ? decisionPath : "slow_fallback",
+      source: "rule_shortcut",
+      decisionPath: "rule_shortcut",
       parseIntentV2: normalizeIntentOutput(ruleParsed),
       ...mappedRule,
-      thresholds: { fast: fastThreshold, slow: slowThreshold },
+      thresholds,
       slots: {
         ...mappedRule.slots,
-        basedOnDocUrl: extractDocUrl(text),
-        basedOnSlidesUrl: extractSlidesUrl(text),
-        slidesEditPageIndex: extractSlidesPageIndex(text),
-        needClarify,
+        ...slotExtras,
+        needClarify: false,
+      },
+    };
+  }
+
+  if (!hasAnyLlm) {
+    return {
+      source: "rule_no_llm",
+      decisionPath: "rule_no_llm",
+      parseIntentV2: normalizeIntentOutput(ruleParsed),
+      ...mappedRule,
+      thresholds,
+      slots: {
+        ...mappedRule.slots,
+        ...slotExtras,
+        needClarify: true,
       },
     };
   }
@@ -150,30 +152,26 @@ async function resolveIntent({ text, contextSummary, recentMessages }) {
     const needClarify = llmConfidence < slowThreshold;
     return {
       source: "llm",
-      decisionPath,
+      decisionPath: "llm",
       parseIntentV2: normalizeIntentOutput(llmParsed),
       ...llmMapped,
-      thresholds: { fast: fastThreshold, slow: slowThreshold },
+      thresholds,
       slots: {
         ...llmMapped.slots,
-        basedOnDocUrl: extractDocUrl(text),
-        basedOnSlidesUrl: extractSlidesUrl(text),
-        slidesEditPageIndex: extractSlidesPageIndex(text),
+        ...slotExtras,
         needClarify,
       },
     };
   } catch {
     return {
-      source: "rule",
-      decisionPath: "slow_fallback",
+      source: "rule_fallback",
+      decisionPath: "rule_fallback",
       parseIntentV2: normalizeIntentOutput(ruleParsed),
       ...mappedRule,
-      thresholds: { fast: fastThreshold, slow: slowThreshold },
+      thresholds,
       slots: {
         ...mappedRule.slots,
-        basedOnDocUrl: extractDocUrl(text),
-        basedOnSlidesUrl: extractSlidesUrl(text),
-        slidesEditPageIndex: extractSlidesPageIndex(text),
+        ...slotExtras,
         needClarify: true,
       },
     };
@@ -185,4 +183,3 @@ async function analyzeIntent(args) {
 }
 
 module.exports = { analyzeIntent, resolveIntent };
-

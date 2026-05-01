@@ -29,25 +29,30 @@ function mockDoubaoResponse(payload) {
   });
 }
 
-test("intentAgent: Fast Path (>=0.8) 走规则，不调用LLM", async () => {
+test("intentAgent: 强约束命中 -> rule_shortcut，不调 LLM", async () => {
   await withEnv(
     {
       DOUBAO_API_KEY: "x",
       DOUBAO_ENDPOINT_ID: "y",
-      INTENT_FAST_THRESHOLD: "0.8",
-      INTENT_SLOW_THRESHOLD: "0.6",
     },
     async () => {
       let called = 0;
       const prevFetch = global.fetch;
       global.fetch = async () => {
         called += 1;
-        return mockDoubaoResponse({ output_type: "ppt", ppt_type: "review", doc_type: "report", scenario: "review", confidence: 0.9, reasoning: "llm" })();
+        return mockDoubaoResponse({
+          output_type: "ppt",
+          ppt_type: "review",
+          doc_type: "report",
+          scenario: "review",
+          confidence: 0.9,
+          reasoning: "llm",
+        })();
       };
       try {
         const r = await analyzeIntent({ text: "请生成评审PPT", contextSummary: "", recentMessages: [] });
-        assert.equal(r.decisionPath, "fast");
-        assert.equal(r.source, "rule");
+        assert.equal(r.decisionPath, "rule_shortcut");
+        assert.equal(r.source, "rule_shortcut");
         assert.deepEqual(r.slots.targetArtifacts, ["slides"]);
         assert.equal(called, 0);
       } finally {
@@ -57,13 +62,11 @@ test("intentAgent: Fast Path (>=0.8) 走规则，不调用LLM", async () => {
   );
 });
 
-test("intentAgent: Slow Path (<0.6) 调用LLM", async () => {
+test("intentAgent: 未命中强约束 -> 调用 LLM", async () => {
   await withEnv(
     {
       DOUBAO_API_KEY: "x",
       DOUBAO_ENDPOINT_ID: "y",
-      INTENT_FAST_THRESHOLD: "0.8",
-      INTENT_SLOW_THRESHOLD: "0.6",
     },
     async () => {
       let called = 0;
@@ -82,7 +85,7 @@ test("intentAgent: Slow Path (<0.6) 调用LLM", async () => {
       };
       try {
         const r = await analyzeIntent({ text: "你好", contextSummary: "", recentMessages: [] });
-        assert.equal(r.decisionPath, "slow");
+        assert.equal(r.decisionPath, "llm");
         assert.equal(r.source, "llm");
         assert.equal(called, 1);
       } finally {
@@ -92,65 +95,28 @@ test("intentAgent: Slow Path (<0.6) 调用LLM", async () => {
   );
 });
 
-test("intentAgent: Hybrid 区间有显式类型词 -> 走规则", async () => {
+test("intentAgent: LLM 失败 -> rule_fallback，needClarify=true", async () => {
   await withEnv(
     {
       DOUBAO_API_KEY: "x",
       DOUBAO_ENDPOINT_ID: "y",
-      INTENT_FAST_THRESHOLD: "0.99",
-      INTENT_SLOW_THRESHOLD: "0.9",
     },
     async () => {
       let called = 0;
       const prevFetch = global.fetch;
       global.fetch = async () => {
         called += 1;
-        return mockDoubaoResponse({ output_type: "doc", doc_type: "solution", ppt_type: "report", scenario: "discussion", confidence: 0.7, reasoning: "llm" })();
+        throw new Error("network");
       };
       try {
-        const r = await analyzeIntent({ text: "整理成需求文档", contextSummary: "", recentMessages: [] });
-        assert.equal(r.decisionPath, "hybrid_fast");
-        assert.equal(r.source, "rule");
-        assert.equal(r.slots.parseIntentV2.doc_type, "prd");
-        assert.equal(called, 0);
+        const r = await analyzeIntent({ text: "随便聊聊", contextSummary: "", recentMessages: [] });
+        assert.equal(r.decisionPath, "rule_fallback");
+        assert.equal(r.source, "rule_fallback");
+        assert.equal(r.slots.needClarify, true);
+        assert.ok(called >= 1, "llmChat 会重试，fetch 可能多次");
       } finally {
         global.fetch = prevFetch;
       }
     },
   );
 });
-
-test("intentAgent: Hybrid 区间无显式类型词 -> 调用LLM", async () => {
-  await withEnv(
-    {
-      DOUBAO_API_KEY: "x",
-      DOUBAO_ENDPOINT_ID: "y",
-      INTENT_FAST_THRESHOLD: "0.99",
-      INTENT_SLOW_THRESHOLD: "0.9",
-    },
-    async () => {
-      let called = 0;
-      const prevFetch = global.fetch;
-      global.fetch = async () => {
-        called += 1;
-        return mockDoubaoResponse({
-          output_type: "doc",
-          doc_type: "meeting_summary",
-          ppt_type: "report",
-          scenario: "discussion",
-          confidence: 0.71,
-          reasoning: "llm",
-        })();
-      };
-      try {
-        const r = await analyzeIntent({ text: "整理一下刚才聊的需求", contextSummary: "", recentMessages: [] });
-        assert.equal(r.decisionPath, "hybrid_slow");
-        assert.equal(r.source, "llm");
-        assert.equal(called, 1);
-      } finally {
-        global.fetch = prevFetch;
-      }
-    },
-  );
-});
-

@@ -52,3 +52,10 @@ test("显式类型词命中信号: none", () => {
   assert.equal(result.meta.explicitTypeKind, "none");
 });
 
+test("否定 PPT -> doc，且不作为强约束短路", () => {
+  const result = parseIntent("不要 PPT，整理成文档", {});
+  assert.equal(result.output_type, "doc");
+  assert.equal(result.meta.negatedPpt, true);
+  assert.equal(result.meta.explicitTypeHit, false);
+});
+

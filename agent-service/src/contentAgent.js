@@ -180,9 +180,107 @@ function chunk(arr, size) {
   return out;
 }
 
+function normalizeSlideText(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/^[\-*]+\s*/g, "")
+    .trim();
+}
+
+function evaluateSlidesPlanQuality(plan) {
+  const reasons = [];
+  const slides = Array.isArray(plan?.slides) ? plan.slides : [];
+  const confidence = Number(plan?.confidence ?? 0.7);
+  if (slides.length < 6 || slides.length > 10) reasons.push("slides_count_out_of_range");
+
+  const genericTitleRe = /^(概览|总结|要点|核心要点|结论|背景|方案|风险|下一步|计划)\s*$/;
+  const allBullets = [];
+
+  for (const s of slides) {
+    const title = normalizeSlideText(s?.title);
+    if (!title) reasons.push("empty_title");
+    if (title && genericTitleRe.test(title)) reasons.push("generic_title");
+
+    const bulletsArr = Array.isArray(s?.bullets) ? s.bullets.map(normalizeSlideText).filter(Boolean) : [];
+    if (bulletsArr.length < 3 || bulletsArr.length > 5) reasons.push("bullets_count_out_of_range");
+    allBullets.push(...bulletsArr);
+  }
+
+  // Repetition check across all bullets.
+  const normBullets = allBullets.map((x) => x.toLowerCase()).filter(Boolean);
+  const seen = new Set();
+  let dup = 0;
+  for (const b of normBullets) {
+    if (seen.has(b)) dup += 1;
+    else seen.add(b);
+  }
+  if (normBullets.length >= 12 && dup / Math.max(1, normBullets.length) > 0.25) reasons.push("too_repetitive");
+
+  return { ok: reasons.length === 0, reasons, confidence };
+}
+
+async function callLlmRewriteSlidesPlan({ text, contextSummary, intent, slidesTemplate, cleaned, timeoutMs }) {
+  const pptType = intent && typeof intent === "object" ? intent.ppt_type : "report";
+  const scenario = intent && typeof intent === "object" ? intent.scenario : "discussion";
+  const system = [
+    "你是一个演示稿（PPT）结构与文案生成器。",
+    "任务：根据用户指令与已清洗要点，生成“叙事连贯、可直接上屏”的 PPT 页计划（slides plan）。",
+    "硬性要求：",
+    "- 输出严格 JSON（不要代码块，不要多余解释）。",
+    '- schema: {"slides":[{"title":"","bullets":[""]}],"confidence":0-1}',
+    "- slides 总页数必须在 6-10 页（含封面与附录）。",
+    "- 除封面外，每页 bullets 必须 3-5 条，短句，避免重复。",
+    "输出风格：中文；标题要具体，不要空泛。",
+    `当前意图：ppt_type=${String(pptType)} scenario=${String(scenario)}`,
+    `推荐章节顺序：${Array.isArray(slidesTemplate?.sectionOutline) ? slidesTemplate.sectionOutline.join(" | ") : ""}`,
+  ].join("\n");
+
+  const user = [
+    `用户指令：${String(text || "").trim()}`,
+    `上下文摘要：${String(contextSummary || "").trim()}`,
+    "",
+    "已清洗要点（按桶）：",
+    `- facts: ${(Array.isArray(cleaned?.facts) ? cleaned.facts : []).slice(0, 18).join(" | ")}`,
+    `- decisions: ${(Array.isArray(cleaned?.decisions) ? cleaned.decisions : []).slice(0, 12).join(" | ")}`,
+    `- actions: ${(Array.isArray(cleaned?.actions) ? cleaned.actions : []).slice(0, 12).join(" | ")}`,
+    `- risks: ${(Array.isArray(cleaned?.risks) ? cleaned.risks : []).slice(0, 12).join(" | ")}`,
+    `- constraints: ${(Array.isArray(cleaned?.constraints) ? cleaned.constraints : []).slice(0, 12).join(" | ")}`,
+    `- openQuestions: ${(Array.isArray(cleaned?.openQuestions) ? cleaned.openQuestions : []).slice(0, 12).join(" | ")}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const content = await callLlm({ system, user, timeoutMs, temperature: 0.2, purpose: "content" });
+  const jsonStart = content.indexOf("{");
+  const jsonEnd = content.lastIndexOf("}");
+  if (jsonStart < 0 || jsonEnd < jsonStart) throw new Error("slides plan returned no json");
+  const obj = JSON.parse(content.slice(jsonStart, jsonEnd + 1));
+  const plan = {
+    slides: Array.isArray(obj.slides) ? obj.slides : [],
+    confidence: clamp01(Number(obj.confidence ?? 0.7)),
+  };
+  return plan;
+}
+
 function generateSlidesXmlArray({ bundle, text, intent }) {
   const slidesTemplate = resolveSlidesTemplate(intent);
   const b = bundle && typeof bundle === "object" ? bundle : {};
+  const rewrittenPlan = b?.rewrittenSlidesPlan;
+  if (rewrittenPlan && typeof rewrittenPlan === "object") {
+    const slides = Array.isArray(rewrittenPlan.slides) ? rewrittenPlan.slides : [];
+    const xml = [];
+    for (const s of slides) {
+      const title = normalizeSlideText(s?.title) || "未命名";
+      const bulletsArr = Array.isArray(s?.bullets) ? s.bullets.map(normalizeSlideText).filter(Boolean) : [];
+      xml.push(buildSlideXml({ title, bullets: bulletsArr.slice(0, 6) }));
+    }
+    return xml.slice(0, 10);
+  }
+  // Fail-fast: PPT must have rewritten slides plan for readability.
+  if (slidesTemplate && intent && intent.output_type === "ppt") {
+    throw new Error("missing rewrittenSlidesPlan");
+  }
+
   const structuredLines = Array.isArray(b.pptOutlineLines) ? b.pptOutlineLines.filter(Boolean).map((x) => String(x).trim()).filter(Boolean) : [];
   const outlineLines = pickSlideLinesFromMarkdown(b.outlineMd, 24);
   const summaryLines = pickSlideLinesFromMarkdown(b.summaryMd, 20);
@@ -345,11 +443,31 @@ async function generateContentBundle({ text, contextSummary, targetArtifacts, in
   const outlineMd = typeof obj.outline_md === "string" ? obj.outline_md.trim() : "";
   const confidence = clamp01(Number(obj.confidence ?? 0.7));
   if (!summaryMd || !requirementsMd || !clarifyMd || !outlineMd) throw new Error("LLM content missing required fields");
-  const structured = withRestructure({ source: "doubao", summaryMd, requirementsMd, clarifyMd, outlineMd, confidence });
+  const structured = withRestructure({ source: "llm", summaryMd, requirementsMd, clarifyMd, outlineMd, confidence });
 
-  // Optional: rewrite final doc body for solution-type docs.
+  // PPT: rewrite slides plan + quality gate (fail-fast).
+  if (wantsSlides) {
+    const slidesTimeoutMs = Number(envOptional("PPT_REWRITE_TIMEOUT_MS") ?? String(timeoutMs));
+    const plan = await callLlmRewriteSlidesPlan({
+      text,
+      contextSummary,
+      intent,
+      slidesTemplate,
+      cleaned: structured.cleaned,
+      timeoutMs: slidesTimeoutMs,
+    });
+    const q = evaluateSlidesPlanQuality(plan);
+    if (!q.ok) {
+      const reasons = Array.isArray(q.reasons) ? q.reasons.join(",") : "unknown";
+      throw new Error(`slides plan quality gate failed: ${reasons}`);
+    }
+    structured.rewrittenSlidesPlan = plan;
+    structured.rewrittenSlidesConfidence = q.confidence;
+  }
+
+  // Optional: rewrite final doc body for all doc types (readability-first).
   const enabledEnv = parseBoolEnv(envOptional("DOC_REWRITE_ENABLED"));
-  const shouldRewrite = enabledEnv == null ? String(docType) === "solution" : enabledEnv === true;
+  const shouldRewrite = enabledEnv == null ? wantsDoc === true : enabledEnv === true;
   if (!shouldRewrite) return structured;
 
   const rewriteTimeoutMs = Number(envOptional("DOC_REWRITE_TIMEOUT_MS") ?? String(timeoutMs));
@@ -364,7 +482,10 @@ async function generateContentBundle({ text, contextSummary, targetArtifacts, in
     timeoutMs: rewriteTimeoutMs,
   });
   const quality = evaluateDocQuality(rw.rewrittenMd);
-  if (!quality.ok) return structured;
+  if (!quality.ok) {
+    const reasons = Array.isArray(quality.reasons) ? quality.reasons.join(",") : "unknown";
+    throw new Error(`rewrittenMd quality gate failed: ${reasons}`);
+  }
   return {
     ...structured,
     rewrittenMd: rw.rewrittenMd,

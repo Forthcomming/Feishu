@@ -80,10 +80,17 @@ test("contentAgent: 用户给出显式大纲时以其为主并补齐结构", asy
 test("contentAgent: 可从 bundle 生成最小 slidesXmlArray", () => {
   const slides = generateSlidesXmlArray({
     bundle: {
-      outlineMd: "## 评审演示稿大纲\n- 背景与目标\n- 方案要点\n- 风险与待确认\n- 里程碑与下一步",
-      summaryMd: "## 摘要\n- 目标明确\n- 需要排期",
-      requirementsMd: "## 需求\n- 支持飞书PPT",
-      pptOutlineLines: ["背景与目标", "决策：采用A", "风险：兼容性", "行动项：排期"],
+      rewrittenSlidesPlan: {
+        confidence: 0.8,
+        slides: [
+          { title: "评审演示稿（封面）", bullets: ["目标：通过评审并明确决策", "范围：仅本期核心能力", "产物：可执行计划与风险清单"] },
+          { title: "背景与目标（为什么做）", bullets: ["当前痛点：路由纠错成本高", "目标：降低错派并可追溯", "成功标准：错误率下降、可复核"] },
+          { title: "方案概览（怎么做）", bullets: ["先自动路由，再人工复核兜底", "输出置信度与解释", "关键链路可中断可回放"] },
+          { title: "关键风险与对策", bullets: ["非结构化图片/手写影响识别", "低置信度强制进入复核", "上线前做回归样本集"] },
+          { title: "里程碑与排期", bullets: ["5/6 前交付交互原型", "Alpha：验证复核闭环", "上线：灰度+监控"] },
+          { title: "需要决策/支持", bullets: ["是否确认范围边界", "是否需要审批流", "资源与时间投入确认"] },
+        ],
+      },
     },
     text: "请生成评审PPT",
     intent: { output_type: "ppt", doc_type: "report", ppt_type: "review", scenario: "review" },
@@ -92,5 +99,17 @@ test("contentAgent: 可从 bundle 生成最小 slidesXmlArray", () => {
   assert.ok(slides.length > 0);
   assert.match(slides[0], /<slide\b/);
   assert.match(slides[0], /textType="title"/);
+});
+
+test("contentAgent: 缺少 rewrittenSlidesPlan 时 PPT 生成应 fail-fast", () => {
+  assert.throws(
+    () =>
+      generateSlidesXmlArray({
+        bundle: { pptOutlineLines: ["背景与目标", "方案要点"] },
+        text: "请生成评审PPT",
+        intent: { output_type: "ppt", doc_type: "report", ppt_type: "review", scenario: "review" },
+      }),
+    /missing rewrittenSlidesPlan/i,
+  );
 });
 
