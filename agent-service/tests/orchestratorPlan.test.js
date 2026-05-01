@@ -7,20 +7,33 @@ const { planWorkflow } = require("../src/plannerAgent");
 const { generateContentBundle } = require("../src/contentAgent");
 
 function makeDeps({ events }) {
+  let lastSlidesCreateInput = null;
+  const calls = [];
   return {
     parseIntentStub: () => ({ intent: { name: "doc", confidence: 0.9 } }),
     planWorkflow,
     generateContentBundle,
     buildDocsCreateArgs: (x) => ["docs", "+create", JSON.stringify(x)],
-    buildSlidesCreateArgs: (x) => ["slides", "+create", JSON.stringify(x)],
+    buildDocsUpdateArgs: (x) => ["docs", "+update", JSON.stringify(x)],
+    buildSlidesCreateArgs: (x) => {
+      lastSlidesCreateInput = x;
+      return ["slides", "+create", JSON.stringify(x)];
+    },
     buildImMessagesSendArgs: (x) => ["im", "+messages-send", JSON.stringify(x)],
     runLarkCli: async (args) => {
       const cmd = Array.isArray(args) ? args.join(" ") : String(args);
+      calls.push(cmd);
       if (cmd.includes("docs") && cmd.includes("+create")) {
+        return { stdout: JSON.stringify({ data: { document: { url: "https://example.com/docx/abc" } } }) };
+      }
+      if (cmd.includes("docs") && cmd.includes("+update")) {
         return { stdout: JSON.stringify({ data: { document: { url: "https://example.com/docx/abc" } } }) };
       }
       if (cmd.includes("slides") && cmd.includes("+create")) {
         return { stdout: JSON.stringify({ data: { url: "https://example.com/slides/xyz" } }) };
+      }
+      if (cmd.includes("xml_presentation.slide") && cmd.includes("create")) {
+        return { stdout: JSON.stringify({ ok: true }) };
       }
       return { stdout: JSON.stringify({ ok: true }) };
     },
@@ -35,6 +48,8 @@ function makeDeps({ events }) {
     publishTaskEvent: async (evt) => {
       events.push(evt);
     },
+    getLastSlidesCreateInput: () => lastSlidesCreateInput,
+    getCalls: () => calls,
   };
 }
 
@@ -80,5 +95,54 @@ test("orchestrator: planning 后 steps 被替换为 planner 输出（包含 8-12
   assert.ok(ids.has("step_create_doc"));
   assert.ok(ids.has("step_send_delivery_message"));
   assert.ok(done.artifacts.some((a) => a.kind === "doc"));
+});
+
+test("orchestrator: slides 步骤会传入非空 slidesXmlArray 并产出演示稿链接", async () => {
+  const events = [];
+  const deps = makeDeps({ events });
+  const orchestrator = new AgentOrchestrator(deps);
+
+  const taskId = "task_test_slides_1";
+  const task = deps.taskStore.create({
+    taskId,
+    conversationId: "c2",
+    state: "detecting",
+    currentStepId: null,
+    steps: [
+      { stepId: "step_extract_intent", label: "提取意图", status: "pending" },
+      { stepId: "step_planning", label: "生成执行计划", status: "pending" },
+      { stepId: "step_create_slides", label: "创建演示稿", status: "pending" },
+      { stepId: "step_send_delivery_message", label: "回 IM 交付", status: "pending" },
+    ],
+    artifacts: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    lastError: null,
+  });
+
+  // Auto-approve risk guard when dryRun=false (tests are non-interactive).
+  setTimeout(() => {
+    deps.taskStore.resolveConfirm(taskId, "step_risk_guard", true, null);
+  }, 0);
+
+  await orchestrator.runWorkflow(task.taskId, {
+    taskId,
+    conversationId: "c2",
+    input: "请生成一版评审PPT，重点讲目标、方案和风险。",
+    contextSummary: "目标明确，需要评审。",
+    targetArtifacts: ["slides"],
+    delivery: { channel: "im_chat", chatId: "oc_test" },
+    execution: { dryRun: false, defaultIdentity: "bot", slidesIdentity: "user" },
+  });
+
+  const done = deps.taskStore.get(taskId);
+  assert.equal(done.state, "completed");
+  assert.ok(done.artifacts.some((a) => a.kind === "slides" && a.url));
+  const slidesInput = deps.getLastSlidesCreateInput();
+  assert.ok(slidesInput);
+  assert.ok(Array.isArray(slidesInput.slidesXmlArray));
+  // We create deck first, then add pages via xml_presentation.slide.create (stdin), so +create keeps slides empty.
+  assert.equal(slidesInput.slidesXmlArray.length, 0);
+  assert.ok(deps.getCalls().some((c) => c.includes("xml_presentation.slide") && c.includes("create")));
 });
 

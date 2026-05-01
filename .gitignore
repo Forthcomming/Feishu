@@ -2,7 +2,9 @@
 Thumbs.db
 
 # env / secrets
-**/.env*
+**/.env
+**/.env.*
+!**/.env.example
 **/*.pem
 
 # dependencies

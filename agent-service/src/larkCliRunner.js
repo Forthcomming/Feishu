@@ -1,4 +1,5 @@
 const { spawn } = require("node:child_process");
+const iconv = require("iconv-lite");
 
 function getCliBin() {
   const bin = process.env.LARK_CLI_BIN;
@@ -20,7 +21,7 @@ function shouldWrapWithCmd(bin) {
   return isWindowsCmd(s) || !hasPathSep;
 }
 
-function runLarkCli(args, { timeoutMs = 30_000 } = {}) {
+function runLarkCli(args, { timeoutMs = 30_000, stdin = null } = {}) {
   return new Promise((resolve, reject) => {
     const bin = getCliBin();
 
@@ -31,19 +32,32 @@ function runLarkCli(args, { timeoutMs = 30_000 } = {}) {
     const child = spawn(command, commandArgs, {
       shell: false,
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks = [];
+    const stderrChunks = [];
 
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error("lark-cli timeout"));
     }, timeoutMs);
 
-    child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
-    child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    child.stdout.on("data", (d) => stdoutChunks.push(Buffer.from(d)));
+    child.stderr.on("data", (d) => stderrChunks.push(Buffer.from(d)));
+
+    if (typeof stdin === "string") {
+      try {
+        child.stdin.write(stdin, "utf8");
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      child.stdin.end();
+    } catch {
+      // ignore
+    }
 
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -60,6 +74,19 @@ function runLarkCli(args, { timeoutMs = 30_000 } = {}) {
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      const stdoutBuffer = Buffer.concat(stdoutChunks);
+      const stderrBuffer = Buffer.concat(stderrChunks);
+      const decode = (buf) => {
+        if (!buf || buf.length === 0) return "";
+        const utf8 = buf.toString("utf8");
+        if (!utf8.includes("�")) return utf8;
+        // Windows CLI commonly emits CP936/GBK; fallback to reduce mojibake in error messages.
+        const gbk = iconv.decode(buf, "cp936");
+        if (typeof gbk === "string" && gbk.trim()) return gbk;
+        return utf8;
+      };
+      const stdout = decode(stdoutBuffer).trim();
+      const stderr = decode(stderrBuffer).trim();
       if (code !== 0) {
         const msg = (stderr || stdout || "").trim();
         reject(new Error(msg || `lark-cli exited with code ${code}`));

@@ -1,8 +1,11 @@
+const path = require("node:path");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
+
 const express = require("express");
 const { parseIntentStub } = require("./src/intentParser");
 const { analyzeIntent } = require("./src/intentAgent");
 const { planWorkflow } = require("./src/plannerAgent");
-const { buildDocsCreateArgs, buildImMessagesListArgs, buildImMessagesSendArgs, buildSlidesCreateArgs } = require("./src/larkCliCommands");
+const { buildDocsCreateArgs, buildDocsUpdateArgs, buildImMessagesListArgs, buildImMessagesSendArgs, buildSlidesCreateArgs } = require("./src/larkCliCommands");
 const { runLarkCli, tryParseJson } = require("./src/larkCliRunner");
 const { TaskStore } = require("./src/taskStore");
 const { AgentOrchestrator } = require("./src/orchestrator");
@@ -186,6 +189,7 @@ const orchestrator = new AgentOrchestrator({
   parseIntentStub,
   planWorkflow,
   buildDocsCreateArgs,
+  buildDocsUpdateArgs,
   buildSlidesCreateArgs,
   buildImMessagesSendArgs,
   runLarkCli,
@@ -193,6 +197,27 @@ const orchestrator = new AgentOrchestrator({
   taskStore,
   publishTaskEvent,
 });
+
+async function fetchRecentImContext({ chatId, identities, limit }) {
+  const safeChatId = typeof chatId === "string" ? chatId.trim() : "";
+  const safeLimit = typeof limit === "number" && Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.floor(limit))) : 20;
+  const tries = Array.isArray(identities) && identities.length > 0 ? identities : ["bot", "user"];
+  let lastError = "";
+  for (const as of tries) {
+    try {
+      const listArgs = buildImMessagesListArgs({ as, chatId: safeChatId, limit: safeLimit });
+      const listResp = await runLarkCli(listArgs, { timeoutMs: 30_000 });
+      const parsed = tryParseJson(listResp.stdout);
+      if (!parsed.ok) throw new Error("messages-list returned non-json");
+      const lines = extractImTextLines(parsed.value);
+      const summary = summarizeContext(lines);
+      return { ok: true, as, lines, summary };
+    } catch (e) {
+      lastError = e && e.message ? e.message : String(e);
+    }
+  }
+  return { ok: false, as: tries[0] || "bot", lines: [], summary: "", error: lastError };
+}
 
 app.get("/healthz", (req, res) => {
   res.json({ ok: true });
@@ -302,7 +327,7 @@ app.post("/api/feishu/events", (req, res) => {
           contextRange: { mode: "recent_messages", limit: 20 },
           targetArtifacts: Array.isArray(intent?.slots?.targetArtifacts) ? intent.slots.targetArtifacts : decideTargetArtifactsFromText(text),
           delivery: { channel: "im_chat", chatId },
-          execution: { dryRun, defaultIdentity },
+          execution: { dryRun, defaultIdentity, docIdentity: "user", slidesIdentity: "user" },
         });
       } catch (e) {
         // If orchestration fails fast, report to IM for easier debugging.
@@ -409,15 +434,60 @@ app.post("/api/agent/workflow/start", async (req, res) => {
       return;
     }
 
+    // Best-effort: enrich input with recent IM messages when requested.
+    // This fixes "plan nodes show 暂无" when user input is short but chat has rich context.
+    const contextRange = body.contextRange || { mode: "recent_messages", limit: 20 };
+    const execution = body.execution || { dryRun: true, defaultIdentity: "user" };
+    const delivery = body.delivery || { channel: "im_chat", chatId: "" };
+    let contextSummary = typeof body.contextSummary === "string" ? body.contextSummary.trim() : "";
+    let enrichedInput = input;
+    let contextDebug = { enriched: false, usedChatId: "", usedIdentity: "", lines: 0, error: "" };
+    try {
+      const mode = typeof contextRange?.mode === "string" ? contextRange.mode : "";
+      const wantsRecent = mode === "recent_messages";
+      const bodyChatId = typeof body.chatId === "string" ? body.chatId.trim() : "";
+      const chatId =
+        (typeof delivery?.chatId === "string" && delivery.chatId.trim() ? delivery.chatId.trim() : "") ||
+        bodyChatId ||
+        conversationId;
+      const limitRaw = contextRange?.limit;
+      const limit = typeof limitRaw === "number" && Number.isFinite(limitRaw) ? Math.max(1, Math.min(50, Math.floor(limitRaw))) : 20;
+      const preferred = execution?.defaultIdentity === "user" || execution?.defaultIdentity === "bot" ? execution.defaultIdentity : null;
+      const identities = preferred ? [preferred, preferred === "bot" ? "user" : "bot"] : ["bot", "user"];
+      if (wantsRecent && chatId) {
+        const ctx = await fetchRecentImContext({ chatId, identities, limit });
+        contextDebug.usedChatId = chatId;
+        contextDebug.usedIdentity = ctx.as;
+        contextDebug.lines = Array.isArray(ctx.lines) ? ctx.lines.length : 0;
+        contextDebug.error = ctx.ok ? "" : ctx.error || "";
+        if (ctx.ok && ctx.lines.length > 0) {
+          const summary = ctx.summary;
+          if (!contextSummary) contextSummary = summary;
+          const quotes = ctx.lines
+            .slice(-6)
+            .map((l) => `> ${String(l).replace(/\r?\n/g, " ").trim()}`)
+            .join("\n");
+          const contextBlock = `\n\n${summary}\n\n## 关键原文引用（最近6条）\n${quotes || "> （暂无）"}\n`;
+          enrichedInput = `${input}${contextBlock}`;
+          contextDebug.enriched = true;
+        }
+      } else if (wantsRecent && !chatId) {
+        contextDebug.error = "missing chatId for recent_messages";
+      }
+    } catch {
+      // ignore enrichment errors
+    }
+
     const taskId = getId("task");
     const task = await orchestrator.startWorkflow({
       taskId,
       conversationId,
-      input,
-      contextRange: body.contextRange || { mode: "recent_messages", limit: 20 },
+      input: enrichedInput,
+      contextSummary,
+      contextRange,
       targetArtifacts: Array.isArray(body.targetArtifacts) ? body.targetArtifacts : ["doc"],
-      delivery: body.delivery || { channel: "im_chat", chatId: "" },
-      execution: body.execution || { dryRun: true, defaultIdentity: "user" },
+      delivery,
+      execution,
     });
 
     res.json({
@@ -428,6 +498,7 @@ app.post("/api/agent/workflow/start", async (req, res) => {
         state: task.state,
       },
       subscribe: { channel: `task:${task.taskId}` },
+      contextDebug,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e && e.message ? e.message : String(e) });
@@ -585,6 +656,24 @@ app.post("/api/lark-cli/docs/create", async (req, res) => {
       title: body.title,
       markdown: body.markdown,
       apiVersion: body.apiVersion,
+      dryRun: body.dryRun,
+    });
+
+    const { stdout } = await runLarkCli(args, { timeoutMs: 60_000 });
+    const parsed = tryParseJson(stdout);
+    res.json({ ok: true, args, result: parsed.ok ? parsed.value : stdout, parsed: parsed.ok });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e && e.message ? e.message : String(e) });
+  }
+});
+
+app.post("/api/lark-cli/slides/create", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const args = buildSlidesCreateArgs({
+      as: body.as,
+      title: body.title,
+      slidesXmlArray: body.slidesXmlArray,
       dryRun: body.dryRun,
     });
 

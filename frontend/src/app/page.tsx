@@ -1,12 +1,10 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { DocumentRenderer } from "@/components/DocumentRenderer";
 import type { DocumentPayload } from "@/lib/docTypes";
-import type { PptPreviewPayload } from "@/lib/docToSlides";
 import { TaskPanel } from "@/components/TaskPanel";
 import type { Task } from "@/lib/taskTypes";
 import {
@@ -95,11 +93,28 @@ export default function Home() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | undefined>(undefined);
   const [startedWorkflowTaskId, setStartedWorkflowTaskId] = useState<string | null>(null);
+  const [slidesRehearsalUrl, setSlidesRehearsalUrl] = useState("");
   const [confirmRequest, setConfirmRequest] = useState<{ taskId: string; stepId: string; reason: string } | null>(
     null,
   );
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const currentWorkflowTaskIdRef = useRef<string | null>(null);
+  const seenArtifactIdsRef = useRef<Set<string>>(new Set());
+  const appendArtifactsToMessages = (
+    artifacts: Array<{ artifactId?: string; kind: string; title: string; url: string }>,
+  ) => {
+    const newMsgs: ChatMessage[] = [];
+    for (const a of artifacts) {
+      const aid =
+        typeof a.artifactId === "string" && a.artifactId.trim() ? a.artifactId.trim() : `${a.kind}:${a.title}:${a.url}`;
+      if (seenArtifactIdsRef.current.has(aid)) continue;
+      seenArtifactIdsRef.current.add(aid);
+      if (a.kind === "slides" && typeof a.url === "string" && a.url.trim()) setSlidesRehearsalUrl(a.url);
+      const content = a.url ? `已生成${a.kind.toUpperCase()}：${a.title}\n${a.url}` : `已生成${a.kind.toUpperCase()}：${a.title}`;
+      newMsgs.push({ id: makeId("m"), role: "assistant", kind: "text", content });
+    }
+    if (newMsgs.length > 0) setMessages((prev) => [...prev, ...newMsgs]);
+  };
 
   const effectiveTaskId = useMemo(() => {
     const trimmed = typeof taskIdFromUrl === "string" ? taskIdFromUrl.trim() : "";
@@ -168,11 +183,18 @@ export default function Home() {
         const payload = (await resp.json()) as {
           ok: boolean;
           task?: { steps?: Array<{ stepId: string; status: "pending" | "running" | "completed" | "failed" }>; state?: string };
-          artifacts?: Array<{ kind: string; title: string; url: string }>;
+          artifacts?: Array<{ artifactId?: string; kind: string; title: string; url: string }>;
           error?: string | null;
         };
         if (!payload.ok || !payload.task?.steps) return;
         setTasks(payload.task.steps.map((s) => ({ id: s.stepId, title: s.stepId, status: toTaskStatus(s.status) })));
+        const slidesArtifact = Array.isArray(payload.artifacts)
+          ? payload.artifacts.find((a) => a.kind === "slides" && typeof a.url === "string" && a.url.trim())
+          : null;
+        if (slidesArtifact?.url) {
+          setSlidesRehearsalUrl(slidesArtifact.url);
+        }
+        appendArtifactsToMessages(Array.isArray(payload.artifacts) ? payload.artifacts : []);
         const active = payload.task.steps.find((s) => s.status === "running");
         setActiveTaskId(active?.stepId);
         if (payload.task.state === "completed" || payload.task.state === "failed" || payload.task.state === "cancelled") {
@@ -197,6 +219,11 @@ export default function Home() {
       if (!currentWorkflowTaskIdRef.current || p.taskId !== currentWorkflowTaskIdRef.current) return;
       const nextTasks = p.steps.map((s) => ({ id: s.stepId, title: s.label, status: toTaskStatus(s.status) }));
       setTasks(nextTasks);
+      appendArtifactsToMessages(
+        Array.isArray(p.artifacts)
+          ? p.artifacts.map((a) => ({ artifactId: a.artifactId, kind: a.kind, title: a.title, url: a.url }))
+          : [],
+      );
       const active = p.steps.find((s) => s.status === "running");
       setActiveTaskId(active?.stepId);
       if (p.confirmRequired && p.confirmRequired.stepId) {
@@ -226,11 +253,7 @@ export default function Home() {
 
     const offTaskArtifact = onTaskArtifact((p: TaskArtifactEvent) => {
       if (!currentWorkflowTaskIdRef.current || p.taskId !== currentWorkflowTaskIdRef.current) return;
-      const content = p.artifact.url
-        ? `已生成${p.artifact.kind.toUpperCase()}：${p.artifact.title}\n${p.artifact.url}`
-        : `已生成${p.artifact.kind.toUpperCase()}：${p.artifact.title}`;
-      const aiMsg: ChatMessage = { id: makeId("m"), role: "assistant", kind: "text", content };
-      setMessages((prev) => [...prev, aiMsg]);
+      appendArtifactsToMessages([{ artifactId: p.artifact.artifactId, kind: p.artifact.kind, title: p.artifact.title, url: p.artifact.url }]);
     });
 
     const offTaskError = onTaskError((p: TaskErrorEvent) => {
@@ -294,24 +317,6 @@ export default function Home() {
     setConfirmRequest(null);
   };
 
-  const openPptPreview = (payload: PptPreviewPayload) => {
-    sessionStorage.setItem("ppt_preview_v1", JSON.stringify(payload));
-    router.push("/ppt");
-  };
-
-  const isValidPptPreviewPayload = (p: unknown): p is PptPreviewPayload => {
-    if (!p || typeof p !== "object") return false;
-    const obj = p as { title?: unknown; slides?: unknown };
-    return typeof obj.title === "string" && Array.isArray(obj.slides);
-  };
-
-  const parsePptInstruction = (text: string) => {
-    // 仅在包含关键词“生成PPT”时使用；把前缀（及可能的冒号）去掉，其余作为自然语言指令
-    const idx = text.indexOf("生成PPT");
-    const tail = idx >= 0 ? text.slice(idx + "生成PPT".length) : "";
-    return tail.replace(/^[\s:：,，-]+/g, "").trim();
-  };
-
   async function onSend() {
     const text = input.trim();
     if (!text || isLoading) return;
@@ -330,27 +335,47 @@ export default function Home() {
       const syncDryRun = process.env.NEXT_PUBLIC_WORKFLOW_DRY_RUN !== "false";
 
       if (text.includes("生成PPT")) {
-        const instruction = parsePptInstruction(text);
-        const resp = await fetch("/api/generate-ppt", {
+        const deliveryChatId = process.env.NEXT_PUBLIC_DELIVERY_CHAT_ID ?? "";
+        const workflowDryRun = process.env.NEXT_PUBLIC_WORKFLOW_DRY_RUN !== "false";
+        const resp = await fetch("/api/agent/workflow/start", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ trigger: "生成PPT", contextMessages, instruction }),
+          body: JSON.stringify({
+            conversationId: "demo_conversation",
+            input: text,
+            contextRange: { mode: "recent_messages", limit: 20 },
+            targetArtifacts: ["slides"],
+            delivery: { channel: "im_chat", chatId: deliveryChatId },
+            execution: { dryRun: workflowDryRun, defaultIdentity: "bot", docIdentity: "user", slidesIdentity: "user" },
+          }),
         });
         if (!resp.ok) {
           const msg = await resp.text().catch(() => "");
           throw new Error(msg || `Request failed: ${resp.status}`);
         }
-        const payloadUnknown = (await resp.json()) as unknown;
-        if (!isValidPptPreviewPayload(payloadUnknown)) {
-          throw new Error("PPT 接口返回格式不正确");
+        const payload = (await resp.json()) as {
+          ok: boolean;
+          task?: { taskId: string; state: string };
+        };
+        if (!payload.ok || !payload.task?.taskId) {
+          throw new Error("workflow start 返回格式不正确");
         }
-        const payload = payloadUnknown as PptPreviewPayload;
-        openPptPreview(payload);
+        const startedTaskId = payload.task.taskId;
+        seenArtifactIdsRef.current.clear();
+        setSlidesRehearsalUrl("");
+        setTasks([]);
+        setActiveTaskId(undefined);
+        setStartedWorkflowTaskId(startedTaskId);
+        {
+          const next = new URLSearchParams(searchParams.toString());
+          next.set("taskId", startedTaskId);
+          router.replace(`/?${next.toString()}`);
+        }
         const aiMsg: ChatMessage = {
           id: makeId("m"),
           role: "assistant",
           kind: "text",
-          content: "PPT 已生成，正在打开预览…",
+          content: `已启动飞书PPT生成任务（${startedTaskId}），生成后可直接打开飞书排练。`,
         };
         setMessages((prev) => [...prev, aiMsg]);
         return;
@@ -368,7 +393,8 @@ export default function Home() {
             contextRange: { mode: "recent_messages", limit: 20 },
             targetArtifacts: ["doc"],
             delivery: { channel: "im_chat", chatId: deliveryChatId },
-            execution: { dryRun: workflowDryRun, defaultIdentity: "bot" },
+            // Use bot for IM ack/delivery by default, but use user identity for docs.create to ensure you can view the doc.
+            execution: { dryRun: workflowDryRun, defaultIdentity: "bot", docIdentity: "user" },
           }),
         });
         if (!resp.ok) {
@@ -383,6 +409,7 @@ export default function Home() {
           throw new Error("workflow start 返回格式不正确");
         }
         const startedTaskId = payload.task.taskId;
+        seenArtifactIdsRef.current.clear();
 
         // Sync to Feishu after we have the taskId, and avoid triggering webhook to create another task.
         // agent-service webhook ignores messages starting with this prefix.
@@ -476,12 +503,6 @@ export default function Home() {
         >
           <div className="flex items-center gap-2">
             <div className="text-sm font-semibold text-zinc-900">飞书 IM（Demo）</div>
-            <Link
-              href="/blocks"
-              className="rounded-lg bg-white px-2 py-1 text-xs font-semibold text-zinc-700 ring-1 ring-zinc-200 hover:bg-zinc-50"
-            >
-              Blocks Demo
-            </Link>
             <span
               className={[
                 "ml-1 rounded-full px-2 py-0.5 text-[11px] font-semibold",
@@ -518,6 +539,22 @@ export default function Home() {
               >
                 取消任务
               </button>
+            </div>
+          </section>
+        ) : null}
+        {slidesRehearsalUrl ? (
+          <section className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900 shadow-sm">
+            <div className="font-semibold">飞书排练入口</div>
+            <div className="mt-1">演示稿已生成，可直接在飞书内放映/排练并继续修改。</div>
+            <div className="mt-2">
+              <a
+                href={slidesRehearsalUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex rounded-xl bg-emerald-700 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-600"
+              >
+                打开飞书PPT排练
+              </a>
             </div>
           </section>
         ) : null}

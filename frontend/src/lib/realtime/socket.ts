@@ -1,6 +1,5 @@
 import { io, type Socket } from "socket.io-client";
 
-import type { Block } from "@/lib/blocks";
 import type { Task } from "@/lib/taskTypes";
 
 export type DocId = string;
@@ -8,19 +7,6 @@ export type DocId = string;
 export type TasksState = {
   tasks: Task[];
   activeTaskId?: string;
-};
-
-export type SnapshotPayload = {
-  docId: DocId;
-  blocks: Block[];
-  tasksState: TasksState;
-  serverTs: number;
-};
-
-export type BlocksUpdatePayload = {
-  docId: DocId;
-  blocks: Block[];
-  serverTs: number;
 };
 
 export type TasksUpdatePayload = {
@@ -143,20 +129,6 @@ export function joinTask(taskId: string) {
   s.emit("task:join", { taskId, clientId: getClientId() });
 }
 
-export function onSnapshot(handler: (p: SnapshotPayload) => void) {
-  const s = getSocket();
-  if (!s) return () => {};
-  s.on("snapshot", handler);
-  return () => s.off("snapshot", handler);
-}
-
-export function onBlocksUpdate(handler: (p: BlocksUpdatePayload) => void) {
-  const s = getSocket();
-  if (!s) return () => {};
-  s.on("blocks:update", handler);
-  return () => s.off("blocks:update", handler);
-}
-
 export function onTasksUpdate(handler: (p: TasksUpdatePayload) => void) {
   const s = getSocket();
   if (!s) return () => {};
@@ -204,12 +176,6 @@ export function onTaskConfirmRequired(handler: (p: TaskConfirmRequiredEvent) => 
   if (!s) return () => {};
   s.on("task.confirm_required", handler);
   return () => s.off("task.confirm_required", handler);
-}
-
-export function emitBlocksUpdate(docId: DocId, blocks: Block[]) {
-  const s = getSocket();
-  if (!s) return;
-  s.emit("blocks:update", { docId, blocks, clientId: getClientId(), ts: Date.now() });
 }
 
 export function emitTasksUpdate(docId: DocId, tasksState: TasksState) {

@@ -1,6 +1,7 @@
 const { artifactEvent, errorEvent, stateEvent, stepEvent } = require("./taskEvents");
 const { confirmRequiredEvent } = require("./taskEvents");
 const { generateContentBundle } = require("./contentAgent");
+const { generateSlidesXmlArray } = require("./contentAgent");
 
 function makeStep(stepId, label) {
   return { stepId, label, status: "pending" };
@@ -40,11 +41,77 @@ function pickDocsCreateUrl(parsedValue) {
   return pickDocUrl(v);
 }
 
+function pickDocUrlFromText(stdout) {
+  const s = String(stdout || "");
+  // Feishu docx link shape: /docx/<token>
+  const m = s.match(/https?:\/\/[^\s"']+\/docx\/[A-Za-z0-9]+/);
+  return m ? m[0] : "";
+}
+
+function pickDocTargetFromInput(text) {
+  const s = String(text || "");
+  const urlMatch = s.match(/https?:\/\/[^\s"']+\/docx\/[A-Za-z0-9]+/);
+  if (urlMatch) return urlMatch[0];
+  const tokenMatch = s.match(/(?:^|[^A-Za-z0-9])docx\/([A-Za-z0-9]+)(?:$|[^A-Za-z0-9])/);
+  if (tokenMatch && tokenMatch[1]) return tokenMatch[1];
+  return "";
+}
+
 function pickSlidesUrlFromCliOutput(stdout) {
   const s = String(stdout || "");
   // Prefer explicit slides links if present.
   const m = s.match(/https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9]+/);
   return m ? m[0] : null;
+}
+
+function pickSlidesCreateUrl(parsedValue) {
+  const v = parsedValue && typeof parsedValue === "object" ? parsedValue : null;
+  const candidates = [
+    v?.data?.slide?.url,
+    v?.data?.slides?.url,
+    v?.data?.url,
+    v?.slide?.url,
+    v?.slides?.url,
+    v?.url,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && /^https?:\/\//.test(c)) return c;
+  }
+  return pickDocUrl(v);
+}
+
+function normalizeErrorMessage(msg) {
+  const s = String(msg || "").trim();
+  if (!s) return "未知错误";
+  if (s.includes("�")) {
+    return "命令执行失败（错误信息编码异常，可能是超时或权限问题，请稍后重试）";
+  }
+  return s;
+}
+
+function shouldFallbackToEmptySlides(err) {
+  const s = String(err && err.message ? err.message : err || "")
+    .toLowerCase()
+    .trim();
+  if (!s) return false;
+  // Only fallback on explicit XML parsing/validation errors.
+  return s.includes("此时不应有 <") || s.includes("unexpected token <") || s.includes("xml");
+}
+
+function extractSlidesTokenFromUrl(url) {
+  const s = String(url || "").trim();
+  const m = s.match(/\/slides\/([A-Za-z0-9]+)/);
+  return m ? m[1] : "";
+}
+
+function makeSlidesPageCreateArgs({ as, xmlPresentationId, dryRun }) {
+  const identity = as === "bot" ? "bot" : "user";
+  const safeId = String(xmlPresentationId || "").trim();
+  const args = ["slides", "xml_presentation.slide", "create", "--as", identity, "--params", JSON.stringify({ xml_presentation_id: safeId }), "--data", "-"];
+  // xml_presentation.slide.create is marked as high-risk-write; require explicit yes when executing.
+  args.push("--yes");
+  if (dryRun !== false) args.push("--dry-run");
+  return args;
 }
 
 class AgentOrchestrator {
@@ -53,6 +120,7 @@ class AgentOrchestrator {
     this.planWorkflow = deps.planWorkflow;
     this.generateContentBundle = deps.generateContentBundle || generateContentBundle;
     this.buildDocsCreateArgs = deps.buildDocsCreateArgs;
+    this.buildDocsUpdateArgs = deps.buildDocsUpdateArgs;
     this.buildSlidesCreateArgs = deps.buildSlidesCreateArgs;
     this.buildImMessagesSendArgs = deps.buildImMessagesSendArgs;
     this.runLarkCli = deps.runLarkCli;
@@ -168,6 +236,7 @@ class AgentOrchestrator {
 
       let docUrl = "";
       let contentBundle = null;
+      let emittedContentArtifact = false;
       const ensureBundle = async () => {
         if (contentBundle) return contentBundle;
         contentBundle = await this.generateContentBundle({
@@ -175,6 +244,32 @@ class AgentOrchestrator {
           contextSummary: input.contextSummary || "",
           targetArtifacts: input.targetArtifacts || [],
         });
+
+        // Emit a human-readable artifact so the frontend can show intermediate results
+        // without requiring users to open the generated doc.
+        if (!emittedContentArtifact) {
+          emittedContentArtifact = true;
+          const safe = (s, max) => {
+            const t = String(s || "").trim();
+            if (!t) return "";
+            if (t.length <= max) return t;
+            return `${t.slice(0, max - 3)}...`;
+          };
+          const summary = safe(contentBundle.summaryMd, 1200);
+          const reqs = safe(contentBundle.requirementsMd, 1200);
+          const clarify = safe(contentBundle.clarifyMd, 900);
+          const outline = safe(contentBundle.outlineMd, 900);
+          const body = [summary, reqs, clarify, outline].filter(Boolean).join("\n\n");
+          const artifact = {
+            artifactId: `note_${Date.now()}`,
+            kind: "note",
+            title: body ? `规划产物（预览）\n\n${body}` : "规划产物（预览）",
+            url: "",
+          };
+          task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, artifact] });
+          await this.emit(artifactEvent(taskId, artifact));
+        }
+
         return contentBundle;
       };
 
@@ -244,15 +339,42 @@ class AgentOrchestrator {
             "## 执行计划（Planner）",
             planLines || "- （暂无）",
           ].join("\n");
-          const docArgs = this.buildDocsCreateArgs({
-            as: input.execution?.defaultIdentity ?? execIdentity,
-            title: "需求文档（Agent）",
-            markdown: docMarkdown,
-            dryRun: input.execution?.dryRun ?? execDryRun,
-          });
-          const docResp = await this.runLarkCli(docArgs, { timeoutMs: 60_000 });
-          const parsedDoc = this.tryParseJson(docResp.stdout);
-          docUrl = pickDocsCreateUrl(parsedDoc.ok ? parsedDoc.value : null) || "";
+          const docTarget = pickDocTargetFromInput(input.input);
+          const canUpdate = Boolean(docTarget && typeof this.buildDocsUpdateArgs === "function");
+
+          if (canUpdate) {
+            const updateMarkdown = [
+              "",
+              `## 本次更新（${new Date().toISOString().slice(0, 19).replace("T", " ")}）`,
+              "",
+              docMarkdown,
+            ].join("\n");
+            const docArgs = this.buildDocsUpdateArgs({
+              as: input.execution?.docIdentity ?? input.execution?.defaultIdentity ?? execIdentity,
+              doc: docTarget,
+              apiVersion: "v2",
+              mode: "append",
+              markdown: updateMarkdown,
+              dryRun: input.execution?.dryRun ?? execDryRun,
+            });
+            const docResp = await this.runLarkCli(docArgs, { timeoutMs: 120_000, stdin: updateMarkdown });
+            const parsedDoc = this.tryParseJson(docResp.stdout);
+            docUrl =
+              pickDocsCreateUrl(parsedDoc.ok ? parsedDoc.value : null) ||
+              pickDocUrlFromText(docResp.stdout) ||
+              (docTarget.startsWith("http") ? docTarget : "");
+          } else {
+            const docArgs = this.buildDocsCreateArgs({
+              as: input.execution?.docIdentity ?? input.execution?.defaultIdentity ?? execIdentity,
+              title: "需求文档（Agent）",
+              apiVersion: "v2",
+              markdown: docMarkdown,
+              dryRun: input.execution?.dryRun ?? execDryRun,
+            });
+            const docResp = await this.runLarkCli(docArgs, { timeoutMs: 120_000, stdin: docMarkdown });
+            const parsedDoc = this.tryParseJson(docResp.stdout);
+            docUrl = pickDocsCreateUrl(parsedDoc.ok ? parsedDoc.value : null) || pickDocUrlFromText(docResp.stdout) || "";
+          }
           const artifact = {
             artifactId: `doc_${Date.now()}`,
             kind: "doc",
@@ -262,17 +384,55 @@ class AgentOrchestrator {
           task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, artifact] });
           await this.emit(artifactEvent(taskId, artifact));
         } else if (s.stepId === "step_create_slides" && wantsSlides) {
+          const b = await ensureBundle().catch(() => null);
           const slidesTitle = "评审演示稿（Agent）";
-          const slidesArgs = this.buildSlidesCreateArgs({
-            as: input.execution?.defaultIdentity ?? "bot",
+          const slidesXmlArray = generateSlidesXmlArray({ bundle: b, text: input.input });
+          let usedFallbackEmptySlides = false;
+          let slidesArgs = this.buildSlidesCreateArgs({
+            as: input.execution?.slidesIdentity ?? "user",
             title: slidesTitle,
+            // Avoid pushing large slides JSON via CLI args on Windows.
+            // Create deck first, then add pages via xml_presentation.slide.create (stdin).
             slidesXmlArray: [],
             dryRun: input.execution?.dryRun ?? execDryRun,
           });
-          const slidesResp = await this.runLarkCli(slidesArgs, { timeoutMs: 60_000 });
+          let slidesResp;
+          try {
+            slidesResp = await this.runLarkCli(slidesArgs, { timeoutMs: 120_000 });
+          } catch (e) {
+            if (!shouldFallbackToEmptySlides(e)) throw e;
+            // Some cli/server combinations reject inline slides XML. Fallback to empty deck creation.
+            usedFallbackEmptySlides = true;
+            slidesArgs = this.buildSlidesCreateArgs({
+              as: input.execution?.slidesIdentity ?? "user",
+              title: slidesTitle,
+              slidesXmlArray: [],
+              dryRun: input.execution?.dryRun ?? execDryRun,
+            });
+            slidesResp = await this.runLarkCli(slidesArgs, { timeoutMs: 120_000 });
+          }
           const parsedSlides = this.tryParseJson(slidesResp.stdout);
           const slidesUrl =
-            (parsedSlides.ok ? pickDocUrl(parsedSlides.value) : null) || pickSlidesUrlFromCliOutput(slidesResp.stdout) || "";
+            (parsedSlides.ok ? pickSlidesCreateUrl(parsedSlides.value) : null) || pickSlidesUrlFromCliOutput(slidesResp.stdout) || "";
+
+          // Best-effort: fill pages via xml_presentation.slide.create to avoid Windows argv limits.
+          const dryRunNow = input.execution?.dryRun ?? execDryRun;
+          if (!dryRunNow && slidesUrl && Array.isArray(slidesXmlArray) && slidesXmlArray.length > 0) {
+            const xmlPresentationId = extractSlidesTokenFromUrl(slidesUrl);
+            if (xmlPresentationId) {
+              for (const slideXml of slidesXmlArray) {
+                const data = JSON.stringify({ slide: { content: String(slideXml || "") } });
+                const pageArgs = makeSlidesPageCreateArgs({
+                  as: input.execution?.slidesIdentity ?? "user",
+                  xmlPresentationId,
+                  dryRun: dryRunNow,
+                });
+                await this.runLarkCli(pageArgs, { timeoutMs: 120_000, stdin: data });
+              }
+            } else {
+              usedFallbackEmptySlides = true;
+            }
+          }
           const slidesArtifact = {
             artifactId: `slides_${Date.now()}`,
             kind: "slides",
@@ -281,6 +441,20 @@ class AgentOrchestrator {
           };
           task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, slidesArtifact] });
           await this.emit(artifactEvent(taskId, slidesArtifact));
+
+          if (usedFallbackEmptySlides) {
+            const hint = {
+              artifactId: `note_slides_fallback_${Date.now()}`,
+              kind: "note",
+              title:
+                "提示：本次演示稿内容填充未完成（已创建演示稿但页面可能为空）。" +
+                "为避免 Windows 命令行参数长度/转义问题，系统会优先“先建稿再逐页写入”。" +
+                "若仍为空，请检查：1) 当前是否 dry-run 2) slides 链接 token 是否可解析 3) slide XML 是否被服务端拒绝。",
+              url: "",
+            };
+            task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, hint] });
+            await this.emit(artifactEvent(taskId, hint));
+          }
         } else if (s.stepId === "step_send_delivery_message") {
           if (input.delivery?.chatId) {
             const slides = task.artifacts.find((a) => a.kind === "slides");
@@ -290,9 +464,9 @@ class AgentOrchestrator {
             if (docLink && !slidesLink) {
               message = `任务已完成，文档链接：${docLink}`;
             } else if (docLink && slidesLink) {
-              message = `任务已完成，文档：${docLink}；演示稿：${slidesLink}`;
+              message = `任务已完成，文档：${docLink}；演示稿：${slidesLink}（打开后可在飞书内放映/排练）`;
             } else if (!docLink && slidesLink) {
-              message = `任务已完成，演示稿链接：${slidesLink}`;
+              message = `任务已完成，演示稿链接：${slidesLink}（打开后可在飞书内放映/排练）`;
             }
             const sendArgs = this.buildImMessagesSendArgs({
               as: input.execution?.defaultIdentity ?? execIdentity,
@@ -313,7 +487,8 @@ class AgentOrchestrator {
       this.taskStore.update(taskId, { state: "completed", currentStepId: null });
       await this.emit(stateEvent(taskId, "completed"));
     } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
+      const rawMsg = err && err.message ? err.message : String(err);
+      const msg = normalizeErrorMessage(rawMsg);
       this.taskStore.update(taskId, { state: "failed", lastError: msg, currentStepId: null });
       await this.emit(
         errorEvent(taskId, this.taskStore.get(taskId)?.currentStepId || "unknown", {

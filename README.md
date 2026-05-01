@@ -20,6 +20,8 @@
    - Phase 1 最小闭环改造清单（`IM -> Doc -> IM交付`）
 3. `IM_Agent_Demo_Script.md`  
    - 比赛演示脚本（A-F 场景映射 + 台词 + 兜底预案）
+4. `IM_Agent_Feishu_CLI_Rules.md`
+   - 飞书 CLI 调用规则（Windows/大内容/编码/超时/可观测性最佳实践）
 
 ## 当前文档角色划分
 

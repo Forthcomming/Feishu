@@ -29,31 +29,51 @@ function buildImMessagesListArgs({ as, chatId, limit }) {
   return ["im", "+messages-list", "--as", identity, "--chat-id", safeChatId, "--limit", String(safeLimit), "--format", "json"];
 }
 
-function escapeTitleForXml(title) {
-  return title.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
 function buildDocsCreateArgs({ as, title, markdown, apiVersion, dryRun }) {
   const identity = assertEnum("as", as ?? "user", ["bot", "user"]);
   const safeTitle = assertString("title", title, { maxLen: 200 });
   const safeMarkdown = assertString("markdown", markdown, { maxLen: 60_000 });
+  // Default to v2 to avoid v1 deprecation/edge cases on some CLI versions.
   const version = typeof apiVersion === "string" && apiVersion.trim() ? apiVersion.trim() : "v2";
 
-  const content = `<title>${escapeTitleForXml(safeTitle)}</title>\n${safeMarkdown}`;
-  const args = [
-    "docs",
-    "+create",
-    "--as",
-    identity,
-    "--api-version",
-    version,
-    "--doc-format",
-    "markdown",
-    "--content",
-    content,
-    "--format",
-    "json",
-  ];
+  // lark-cli contract differs by api-version:
+  // - v2: expects --content + --doc-format (xml|markdown)
+  // - v1: expects --title + --markdown
+  // Ensure markdown starts with heading for readability.
+  const markdownArg = safeMarkdown.startsWith("#") ? safeMarkdown : `# ${safeTitle}\n\n${safeMarkdown}`;
+
+  const args = ["docs", "+create", "--as", identity, "--api-version", version];
+  if (version === "v1") {
+    args.push("--title", safeTitle, "--markdown", markdownArg);
+  } else {
+    // Prefer markdown for v2 (content supports @file, - for stdin via lark-cli itself).
+    args.push("--doc-format", "markdown", "--content", "-");
+  }
+  if (dryRun !== false) args.push("--dry-run");
+  return args;
+}
+
+function buildDocsUpdateArgs({ as, doc, markdown, mode, apiVersion, dryRun, newTitle }) {
+  const identity = assertEnum("as", as ?? "user", ["bot", "user"]);
+  const safeDoc = assertString("doc", doc, { maxLen: 512 });
+  const safeMarkdown = assertString("markdown", markdown, { maxLen: 60_000 });
+  const safeMode =
+    typeof mode === "string" && mode.trim()
+      ? assertEnum("mode", mode.trim(), ["append", "overwrite"])
+      : "append";
+  const version = typeof apiVersion === "string" && apiVersion.trim() ? apiVersion.trim() : "v2";
+
+  // v2 update contract: --command + --content + --doc-format
+  // Keep signature `mode` for callers; map to v2 `command`.
+  const command = safeMode === "overwrite" ? "overwrite" : "append";
+  const args = ["docs", "+update", "--as", identity, "--api-version", version, "--doc", safeDoc];
+  if (version === "v1") {
+    // Fallback: keep old v1 flags for compatibility when explicitly requested.
+    args.push("--mode", safeMode, "--markdown", safeMarkdown);
+  } else {
+    args.push("--command", command, "--doc-format", "markdown", "--content", "-");
+  }
+  if (typeof newTitle === "string" && newTitle.trim()) args.push("--new-title", newTitle.trim());
   if (dryRun !== false) args.push("--dry-run");
   return args;
 }
@@ -74,5 +94,5 @@ function buildSlidesCreateArgs({ as, title, slidesXmlArray, dryRun }) {
   return args;
 }
 
-module.exports = { buildImMessagesSendArgs, buildImMessagesListArgs, buildDocsCreateArgs, buildSlidesCreateArgs };
+module.exports = { buildImMessagesSendArgs, buildImMessagesListArgs, buildDocsCreateArgs, buildDocsUpdateArgs, buildSlidesCreateArgs };
 
