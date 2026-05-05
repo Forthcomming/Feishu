@@ -19,6 +19,7 @@ const { TaskStore } = require("./src/taskStore");
 const { AgentOrchestrator } = require("./src/orchestrator");
 const { publishFeedbackEvent, buildUserRatingFeedback } = require("./src/feedback");
 const { record: recordWorkflowFeedback, listRecent: listWorkflowFeedbackRecent } = require("./src/feedbackStore");
+const { buildContextFromLines } = require("./src/contextPipeline");
 
 const app = express();
 
@@ -266,8 +267,7 @@ async function fetchRecentImContext({ chatId, identities, limit }) {
     const parsed = tryParseJson(listResp.stdout);
     if (!parsed.ok) throw new Error("messages-list returned non-json");
     const lines = extractImTextLines(parsed.value);
-    const summary = summarizeContext(lines);
-    return { ok: true, as, lines, summary, omitAsFlag: Boolean(omitAsFlag) };
+    return { ok: true, as, lines, omitAsFlag: Boolean(omitAsFlag) };
   };
 
   for (const as of tries) {
@@ -286,7 +286,7 @@ async function fetchRecentImContext({ chatId, identities, limit }) {
       }
     }
   }
-  return { ok: false, as: tries[0] || "bot", lines: [], summary: "", error: lastError, omitAsFlag: false };
+  return { ok: false, as: tries[0] || "bot", lines: [], error: lastError, omitAsFlag: false };
 }
 
 app.get("/healthz", (req, res) => {
@@ -358,20 +358,21 @@ app.post("/api/feishu/events", (req, res) => {
         const parsed = tryParseJson(listResp.stdout);
         if (parsed.ok) {
           const lines = extractImTextLines(parsed.value);
-          recentMessages = lines.slice(-20);
-          const summary = summarizeContext(lines);
-          contextSummary = summary;
-          const quotes = lines
-            .slice(-6)
-            .map((l) => `> ${String(l).replace(/\r?\n/g, " ").trim()}`)
-            .join("\n");
-          contextBlock = `\n\n${summary}\n\n## 关键原文引用（最近6条）\n${quotes || "> （暂无）"}\n`;
+          const bundle = buildContextFromLines(lines, text);
+          recentMessages = bundle.topMessages;
+          contextSummary = bundle.structuredContext;
+          contextBlock = `\n\n${bundle.structuredContext}\n`;
         }
       } catch {
         // ignore
       }
 
-      const intent = await analyzeIntent({ text, contextSummary, recentMessages });
+      const intent = await analyzeIntent({
+        text,
+        contextSummary,
+        recentMessages,
+        structuredContext: contextSummary,
+      });
       const threshold = Number(intent?.thresholds?.slow ?? 0.6);
       const confident = intent?.intent?.name !== "unknown" && (intent?.intent?.confidence ?? 0) >= threshold;
       if (!confident) return;
@@ -486,7 +487,12 @@ app.post("/api/agent/parse-intent", async (req, res) => {
 
     const contextSummary = typeof body.contextSummary === "string" ? body.contextSummary.trim() : "";
     const recentMessages = Array.isArray(body.recentMessages) ? body.recentMessages : [];
-    const resolved = await analyzeIntent({ text: input, contextSummary, recentMessages });
+    const resolved = await analyzeIntent({
+      text: input,
+      contextSummary,
+      recentMessages,
+      structuredContext: contextSummary,
+    });
     const result = resolved?.parseIntentV2 || parseIntent(input, { contextSummary, recentMessages });
 
     res.json({
@@ -530,7 +536,7 @@ app.post("/api/agent/workflow/start", async (req, res) => {
     let contextSummary = typeof body.contextSummary === "string" ? body.contextSummary.trim() : "";
     let recentMessages = Array.isArray(body.recentMessages) ? body.recentMessages : [];
     let enrichedInput = input;
-    let contextDebug = { enriched: false, usedChatId: "", usedIdentity: "", lines: 0, error: "" };
+    let contextDebug = { enriched: false, usedChatId: "", usedIdentity: "", lines: 0, topK: 0, error: "" };
     try {
       const mode = typeof contextRange?.mode === "string" ? contextRange.mode : "";
       const wantsRecent = mode === "recent_messages";
@@ -550,14 +556,11 @@ app.post("/api/agent/workflow/start", async (req, res) => {
         contextDebug.lines = Array.isArray(ctx.lines) ? ctx.lines.length : 0;
         contextDebug.error = ctx.ok ? "" : ctx.error || "";
         if (ctx.ok && ctx.lines.length > 0) {
-          recentMessages = ctx.lines.slice(-limit);
-          const summary = ctx.summary;
-          if (!contextSummary) contextSummary = summary;
-          const quotes = ctx.lines
-            .slice(-6)
-            .map((l) => `> ${String(l).replace(/\r?\n/g, " ").trim()}`)
-            .join("\n");
-          const contextBlock = `\n\n${summary}\n\n## 关键原文引用（最近6条）\n${quotes || "> （暂无）"}\n`;
+          const bundle = buildContextFromLines(ctx.lines, input);
+          recentMessages = bundle.topMessages;
+          contextDebug.topK = bundle.topK;
+          if (!contextSummary) contextSummary = bundle.structuredContext;
+          const contextBlock = `\n\n${bundle.structuredContext}\n`;
           enrichedInput = `${input}${contextBlock}`;
           contextDebug.enriched = true;
         }
@@ -570,7 +573,14 @@ app.post("/api/agent/workflow/start", async (req, res) => {
 
     const taskId = getId("task");
     const explicitArtifacts = Array.isArray(body.targetArtifacts) ? body.targetArtifacts : null;
-    const resolvedIntent = explicitArtifacts ? null : await analyzeIntent({ text: input, contextSummary, recentMessages });
+    const resolvedIntent = explicitArtifacts
+      ? null
+      : await analyzeIntent({
+          text: input,
+          contextSummary,
+          recentMessages,
+          structuredContext: contextSummary,
+        });
     const inferredArtifacts = Array.isArray(resolvedIntent?.slots?.targetArtifacts)
       ? resolvedIntent.slots.targetArtifacts
       : resolvedIntent?.parseIntentV2?.output_type === "ppt"

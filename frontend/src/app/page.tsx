@@ -48,6 +48,7 @@ type WorkflowStartContextDebug = {
   usedChatId?: string;
   usedIdentity?: string;
   lines?: number;
+  topK?: number;
   error?: string;
 };
 
@@ -55,9 +56,11 @@ function formatContextDebugLine(d: WorkflowStartContextDebug | undefined): strin
   if (!d || typeof d !== "object") return "";
   const enriched = d.enriched === true;
   const lines = typeof d.lines === "number" ? d.lines : 0;
+  const topK = typeof d.topK === "number" && d.topK > 0 ? d.topK : 0;
   const err = typeof d.error === "string" && d.error.trim() ? d.error.trim() : "";
   if (enriched) {
-    return `【上下文】已用群聊增强输入（约 ${lines} 行）。`;
+    const tail = topK ? `，选用 Top-${topK} 条` : "";
+    return `【上下文】已用群聊增强输入（召回约 ${lines} 行${tail}）。`;
   }
   return `【上下文】未增强（约 ${lines} 行${err ? `；${err}` : ""}）。`;
 }

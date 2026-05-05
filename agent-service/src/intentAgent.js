@@ -59,7 +59,11 @@ function mapParsedIntentToWorkflow(parsed) {
   };
 }
 
-async function callLlmIntent({ text, contextSummary, recentMessages, rulePreview, timeoutMs }) {
+async function callLlmIntent({ text, contextSummary, structuredContext, recentMessages, rulePreview, timeoutMs }) {
+  const structured = String(structuredContext ?? contextSummary ?? "").trim();
+  const summary = String(contextSummary ?? "").trim();
+  const recentJoined = Array.isArray(recentMessages) ? recentMessages.map((s) => String(s).trim()).filter(Boolean).join(" | ") : "";
+
   const system = [
     "你是一个意图理解器（IntentAgent）。",
     "请仅输出严格 JSON（不要代码块，不要多余解释）。",
@@ -73,8 +77,9 @@ async function callLlmIntent({ text, contextSummary, recentMessages, rulePreview
 
   const user = [
     `用户输入：${String(text || "").trim()}`,
-    `上下文摘要：${String(contextSummary || "").trim()}`,
-    `最近消息：${Array.isArray(recentMessages) ? recentMessages.slice(-12).join(" | ") : ""}`,
+    `结构化上下文：${structured}`,
+    `上下文摘要：${summary}`,
+    `最近消息（rerank 后 Top-K，全量）：${recentJoined}`,
     `规则预判：${JSON.stringify(rulePreview || {})}`,
   ].join("\n");
 
@@ -92,7 +97,7 @@ function parseIntentJson(s) {
   return normalizeIntentOutput(obj);
 }
 
-async function resolveIntent({ text, contextSummary, recentMessages }) {
+async function resolveIntent({ text, contextSummary, recentMessages, structuredContext }) {
   const timeoutMs = Number(envOptional("INTENT_TIMEOUT_MS") ?? "6000");
   const slowThreshold = readSlowThresholdForApi();
   const thresholds = { fast: 0.8, slow: slowThreshold };
@@ -142,6 +147,7 @@ async function resolveIntent({ text, contextSummary, recentMessages }) {
     const content = await callLlmIntent({
       text,
       contextSummary,
+      structuredContext,
       recentMessages,
       rulePreview: ruleParsed,
       timeoutMs,
