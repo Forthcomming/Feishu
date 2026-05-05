@@ -6,15 +6,26 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { DocumentRenderer } from "@/components/DocumentRenderer";
 import type { DocumentPayload } from "@/lib/docTypes";
 import { TaskPanel } from "@/components/TaskPanel";
+import { SharedMemo } from "@/components/SharedMemo";
 import type { Task } from "@/lib/taskTypes";
 import {
+  joinConversation,
   joinTask,
+  leaveConversation,
+  onConversationSnapshot,
+  onConversationTaskActive,
+  onPresenceUpdate,
   onTaskArtifact,
   onTaskConfirmRequired,
+  onTaskConfirmResolved,
   onTaskError,
   onTaskSnapshot,
   onTaskState,
   onTaskStep,
+  type ConversationSnapshotPayload,
+  type ConversationTaskActiveEvent,
+  type PresenceEntry,
+  type PresenceUpdatePayload,
   type TaskArtifactEvent,
   type TaskConfirmRequiredEvent,
   type TaskErrorEvent,
@@ -28,9 +39,33 @@ type ChatRole = "user" | "assistant";
 type ChatMessage = {
   id: string;
   role: ChatRole;
-  kind: "text" | "doc";
+  kind: "text" | "doc" | "task_separator";
   content: string | DocumentPayload;
 };
+
+type WorkflowStartContextDebug = {
+  enriched?: boolean;
+  usedChatId?: string;
+  usedIdentity?: string;
+  lines?: number;
+  error?: string;
+};
+
+function formatContextDebugLine(d: WorkflowStartContextDebug | undefined): string {
+  if (!d || typeof d !== "object") return "";
+  const enriched = d.enriched === true;
+  const lines = typeof d.lines === "number" ? d.lines : 0;
+  const err = typeof d.error === "string" && d.error.trim() ? d.error.trim() : "";
+  if (enriched) {
+    return `【上下文】已用群聊增强输入（约 ${lines} 行）。`;
+  }
+  return `【上下文】未增强（约 ${lines} 行${err ? `；${err}` : ""}）。`;
+}
+
+function buildWorkflowAckWithContext(contextDebug: WorkflowStartContextDebug | undefined, body: string): string {
+  const line = formatContextDebugLine(contextDebug);
+  return line ? `${line}\n\n${body}` : body;
+}
 
 function makeId(prefix: string) {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -55,16 +90,28 @@ function isWorkflowKeyword(text: string) {
   return t.includes("生成PPT") || t.includes("需求文档") || (hasDocRef && wantsEdit) || (hasSlidesRef && wantsEdit);
 }
 
+function TaskRunDivider({ label }: { label?: string }) {
+  return (
+    <div className="my-6 flex items-center gap-3" role="separator" aria-label={label ?? "任务分隔"}>
+      <div className="h-px flex-1 bg-gradient-to-r from-transparent via-zinc-400/70 to-zinc-300/50" />
+      <span className="shrink-0 rounded-full bg-indigo-50 px-3 py-1.5 text-[11px] font-semibold tracking-wide text-indigo-800 ring-1 ring-indigo-200/90">
+        {label?.trim() ? label : "开启新任务"}
+      </span>
+      <div className="h-px flex-1 bg-gradient-to-l from-transparent via-zinc-400/70 to-zinc-300/50" />
+    </div>
+  );
+}
+
 function Bubble({ role, message }: { role: ChatRole; message: ChatMessage }) {
   const isUser = role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
         className={[
-          "max-w-[80%] rounded-2xl px-4 py-2 text-sm leading-6 shadow-sm",
+          "max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-6 shadow-sm",
           isUser
-            ? "bg-zinc-900 text-zinc-50"
-            : "bg-white text-zinc-900 ring-1 ring-zinc-200",
+            ? "bg-indigo-600 text-white shadow-indigo-900/10"
+            : "bg-white/95 text-zinc-900 ring-1 ring-zinc-200/80 shadow-zinc-900/5",
         ].join(" ")}
       >
         {message.kind === "doc" && !isUser ? (
@@ -100,9 +147,26 @@ export default function Home() {
   const [confirmRequest, setConfirmRequest] = useState<{ taskId: string; stepId: string; reason: string } | null>(
     null,
   );
+  const [feedbackEligibleTaskId, setFeedbackEligibleTaskId] = useState<string | undefined>(undefined);
+  const [feedbackNote, setFeedbackNote] = useState<string>("");
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState<boolean>(false);
+  const [presence, setPresence] = useState<PresenceEntry[]>([]);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const currentWorkflowTaskIdRef = useRef<string | null>(null);
   const seenArtifactIdsRef = useRef<Set<string>>(new Set());
+  /** 用户点「解绑任务」后，忽略 snapshot 里缓存的 activeTaskId，避免立刻把旧 taskId 写回 URL；新任务以 conversation.task_active 为准。 */
+  const pauseSnapshotTaskBindRef = useRef(false);
+  /** 用于在「当前绑定的 taskId」变化时插入分割线；空串表示尚未记录到非空任务。 */
+  const prevBoundTaskIdForDividerRef = useRef<string>("");
+  /** 本机 onSend 已插入「新任务」分割线时，下一次 taskId 变化由 effect 跳过，避免重复。 */
+  const skipDividerOnNextTaskIdChangeRef = useRef(false);
+
+  const cidFromUrl = searchParams.get("conversationId");
+  const conversationId = useMemo(() => {
+    const fromUrl = typeof cidFromUrl === "string" ? cidFromUrl.trim() : "";
+    if (fromUrl) return fromUrl;
+    return (process.env.NEXT_PUBLIC_DELIVERY_CHAT_ID ?? "").trim();
+  }, [cidFromUrl]);
   const appendArtifactsToMessages = (
     artifacts: Array<{ artifactId?: string; kind: string; title: string; url: string }>,
   ) => {
@@ -124,7 +188,61 @@ export default function Home() {
     return trimmed || startedWorkflowTaskId || "";
   }, [taskIdFromUrl, startedWorkflowTaskId]);
 
+  // 任务 ID 从 A 切到 B 时补一条分割线（IM / 快照 / poll 绑定新任务也会走到这里）；本机发工作流时已插入分割线的由 skip 去重。
+  useEffect(() => {
+    const tid = (effectiveTaskId ?? "").trim();
+    if (!tid) return;
+
+    const prev = prevBoundTaskIdForDividerRef.current;
+    if (prev && prev !== tid) {
+      if (skipDividerOnNextTaskIdChangeRef.current) {
+        skipDividerOnNextTaskIdChangeRef.current = false;
+      } else {
+        const label = "开启新任务";
+        const sep: ChatMessage = {
+          id: makeId("sep"),
+          role: "assistant",
+          kind: "task_separator",
+          content: label,
+        };
+        setMessages((m) => [...m, sep]);
+      }
+    }
+    prevBoundTaskIdForDividerRef.current = tid;
+  }, [effectiveTaskId]);
+
   const realtimeConfigured = useMemo(() => Boolean(process.env.NEXT_PUBLIC_REALTIME_URL), []);
+
+  const clearBoundTask = () => {
+    pauseSnapshotTaskBindRef.current = true;
+    prevBoundTaskIdForDividerRef.current = "";
+    skipDividerOnNextTaskIdChangeRef.current = false;
+    setStartedWorkflowTaskId(null);
+    setTasks([]);
+    setActiveTaskId(undefined);
+    setConfirmRequest(null);
+    setFeedbackEligibleTaskId(undefined);
+    setSlidesRehearsalUrl("");
+    seenArtifactIdsRef.current.clear();
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete("taskId");
+    router.replace(`/?${next.toString()}`);
+  };
+
+  /** 同一页再次发起工作流时先卸下旧 task，避免叠在旧进度上；不暂停 snapshot（马上要绑新 id）。 */
+  const detachPreviousTaskBeforeStart = () => {
+    pauseSnapshotTaskBindRef.current = false;
+    setStartedWorkflowTaskId(null);
+    setTasks([]);
+    setActiveTaskId(undefined);
+    setConfirmRequest(null);
+    setFeedbackEligibleTaskId(undefined);
+    setSlidesRehearsalUrl("");
+    seenArtifactIdsRef.current.clear();
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete("taskId");
+    router.replace(`/?${next.toString()}`);
+  };
 
   useEffect(() => {
     currentWorkflowTaskIdRef.current = effectiveTaskId || null;
@@ -133,10 +251,13 @@ export default function Home() {
 
   // If the workflow is triggered from Feishu IM (webhook), the GUI may not know the taskId.
   // In that case, discover latest taskId by configured delivery chatId and auto-subscribe.
+  // This is the fallback path when realtime is not configured; when realtime is up,
+  // `conversation.task_active` push takes over.
   useEffect(() => {
     if (effectiveTaskId) return;
-    const conversationId = process.env.NEXT_PUBLIC_DELIVERY_CHAT_ID ?? "";
-    if (!conversationId.trim()) return;
+    if (realtimeConfigured) return;
+    if (!conversationId) return;
+    if (pauseSnapshotTaskBindRef.current) return;
 
     let cancelled = false;
     void (async () => {
@@ -163,9 +284,74 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [effectiveTaskId, router, searchParams]);
+  }, [effectiveTaskId, realtimeConfigured, conversationId, router, searchParams]);
+
+  // Scene E: join the conversation room for cross-device presence + task active push.
+  useEffect(() => {
+    if (!realtimeConfigured) return;
+    if (!conversationId) return;
+
+    joinConversation(conversationId);
+
+    const offSnapshot = onConversationSnapshot((p: ConversationSnapshotPayload) => {
+      if (p.cid !== conversationId) return;
+      setPresence(Array.isArray(p.presence) ? p.presence : []);
+      if (pauseSnapshotTaskBindRef.current) return;
+      const tid = typeof p.activeTaskId === "string" ? p.activeTaskId.trim() : "";
+      if (tid && tid !== currentWorkflowTaskIdRef.current) {
+        setStartedWorkflowTaskId(tid);
+        const next = new URLSearchParams(searchParams.toString());
+        next.set("taskId", tid);
+        router.replace(`/?${next.toString()}`);
+      }
+    });
+
+    const offActive = onConversationTaskActive((p: ConversationTaskActiveEvent) => {
+      if (p.conversationId !== conversationId) return;
+      const tid = typeof p.taskId === "string" ? p.taskId.trim() : "";
+      if (!tid) return;
+      if (tid === currentWorkflowTaskIdRef.current) return;
+      pauseSnapshotTaskBindRef.current = false;
+      seenArtifactIdsRef.current.clear();
+      setSlidesRehearsalUrl("");
+      setTasks([]);
+      setActiveTaskId(undefined);
+      setStartedWorkflowTaskId(tid);
+      const next = new URLSearchParams(searchParams.toString());
+      next.set("taskId", tid);
+      router.replace(`/?${next.toString()}`);
+    });
+
+    const offPresence = onPresenceUpdate((p: PresenceUpdatePayload) => {
+      if (p.cid !== conversationId) return;
+      setPresence(Array.isArray(p.presence) ? p.presence : []);
+    });
+
+    const offConfirmResolved = onTaskConfirmResolved((p) => {
+      if (!currentWorkflowTaskIdRef.current || p.taskId !== currentWorkflowTaskIdRef.current) return;
+      setConfirmRequest(null);
+    });
+
+    return () => {
+      offSnapshot();
+      offActive();
+      offPresence();
+      offConfirmResolved();
+      leaveConversation(conversationId);
+    };
+  }, [realtimeConfigured, conversationId, router, searchParams]);
 
   const canSend = useMemo(() => !isLoading && input.trim().length > 0, [input, isLoading]);
+
+  const presenceCounts = useMemo(() => {
+    let desktop = 0;
+    let mobile = 0;
+    for (const p of presence) {
+      if (p.device === "mobile") mobile += 1;
+      else desktop += 1;
+    }
+    return { desktop, mobile };
+  }, [presence]);
 
   const toTaskStatus = (status: "pending" | "running" | "completed" | "failed"): Task["status"] => {
     if (status === "completed") return "done";
@@ -200,8 +386,16 @@ export default function Home() {
         appendArtifactsToMessages(Array.isArray(payload.artifacts) ? payload.artifacts : []);
         const active = payload.task.steps.find((s) => s.status === "running");
         setActiveTaskId(active?.stepId);
-        if (payload.task.state === "completed" || payload.task.state === "failed" || payload.task.state === "cancelled") {
+        if (
+          payload.task.state === "completed" ||
+          payload.task.state === "failed" ||
+          payload.task.state === "cancelled" ||
+          payload.task.state === "idle"
+        ) {
           setActiveTaskId(undefined);
+        }
+        if (payload.task.state === "idle" && effectiveTaskId) {
+          setFeedbackEligibleTaskId(effectiveTaskId);
         }
       } finally {
         // noop
@@ -236,8 +430,16 @@ export default function Home() {
 
     const offTaskState = onTaskState((p: TaskStateEvent) => {
       if (!currentWorkflowTaskIdRef.current || p.taskId !== currentWorkflowTaskIdRef.current) return;
-      if (p.state === "completed" || p.state === "failed") setActiveTaskId(undefined);
-      if (p.state === "completed" || p.state === "failed" || p.state === "cancelled") setConfirmRequest(null);
+      if (p.state === "completed" || p.state === "failed" || p.state === "idle") setActiveTaskId(undefined);
+      if (p.state === "completed" || p.state === "failed" || p.state === "cancelled" || p.state === "idle") {
+        setConfirmRequest(null);
+      }
+      if (p.state === "idle") {
+        setFeedbackEligibleTaskId(p.taskId);
+      }
+      if (p.state === "failed" || p.state === "cancelled") {
+        setFeedbackEligibleTaskId(undefined);
+      }
     });
 
     const offTaskStep = onTaskStep((p: TaskStepEvent) => {
@@ -271,6 +473,7 @@ export default function Home() {
       setTasks((prev) => prev.map((t) => (t.id === p.stepId ? { ...t, status: "failed" } : t)));
       setActiveTaskId(undefined);
       setConfirmRequest(null);
+      setFeedbackEligibleTaskId(undefined);
     });
 
     const offTaskConfirm = onTaskConfirmRequired((p: TaskConfirmRequiredEvent) => {
@@ -330,7 +533,21 @@ export default function Home() {
       .filter((m) => m.kind === "text")
       .slice(-20)
       .map((m) => ({ role: m.role, content: m.content as string }));
-    setMessages((prev) => [...prev, userMsg]);
+    const willStartWorkflow = text.includes("生成PPT") || isWorkflowKeyword(text);
+    if (willStartWorkflow) {
+      setFeedbackEligibleTaskId(undefined);
+      skipDividerOnNextTaskIdChangeRef.current = true;
+      detachPreviousTaskBeforeStart();
+    }
+    const taskSep: ChatMessage | null = willStartWorkflow
+      ? {
+          id: makeId("sep"),
+          role: "assistant",
+          kind: "task_separator",
+          content: "开启新任务",
+        }
+      : null;
+    setMessages((prev) => (taskSep ? [...prev, taskSep, userMsg] : [...prev, userMsg]));
     setIsLoading(true);
 
     try {
@@ -359,6 +576,7 @@ export default function Home() {
         const payload = (await resp.json()) as {
           ok: boolean;
           task?: { taskId: string; state: string };
+          contextDebug?: WorkflowStartContextDebug;
         };
         if (!payload.ok || !payload.task?.taskId) {
           throw new Error("workflow start 返回格式不正确");
@@ -378,7 +596,10 @@ export default function Home() {
           id: makeId("m"),
           role: "assistant",
           kind: "text",
-          content: `已启动飞书PPT生成任务（${startedTaskId}），生成后可直接打开飞书排练。`,
+          content: buildWorkflowAckWithContext(
+            payload.contextDebug,
+            `已启动飞书PPT生成任务（${startedTaskId}），生成后可直接打开飞书排练。`,
+          ),
         };
         setMessages((prev) => [...prev, aiMsg]);
         return;
@@ -410,6 +631,7 @@ export default function Home() {
         const payload = (await resp.json()) as {
           ok: boolean;
           task?: { taskId: string; state: string };
+          contextDebug?: WorkflowStartContextDebug;
         };
         if (!payload.ok || !payload.task?.taskId) {
           throw new Error("workflow start 返回格式不正确");
@@ -418,7 +640,7 @@ export default function Home() {
         seenArtifactIdsRef.current.clear();
 
         // Sync to Feishu after we have the taskId, and avoid triggering webhook to create another task.
-        // agent-service webhook ignores messages starting with this prefix.
+        // agent-service treats this as bot-ack style noise in context; text avoids deliverable-like phrasing.
         if (syncChatId) {
           void (async () => {
             const resp2 = await fetch("/api/im/messages-send", {
@@ -427,7 +649,7 @@ export default function Home() {
               body: JSON.stringify({
                 as: "user",
                 chatId: syncChatId,
-                text: `已收到指令，任务已启动：${startedTaskId}`,
+                text: "已收到指令，任务已开始",
                 dryRun: syncDryRun,
               }),
             });
@@ -458,7 +680,7 @@ export default function Home() {
           id: makeId("m"),
           role: "assistant",
           kind: "text",
-          content: `任务已启动（${startedTaskId}），正在执行…`,
+          content: buildWorkflowAckWithContext(payload.contextDebug, "已收到指令，任务已开始，正在执行…"),
         };
         setMessages((prev) => [...prev, aiMsg]);
         return;
@@ -483,6 +705,7 @@ export default function Home() {
         setMessages((prev) => [...prev, aiMsg]);
       }
     } catch (e) {
+      skipDividerOnNextTaskIdChangeRef.current = false;
       const errText = e instanceof Error ? e.message : String(e);
       const aiMsg: ChatMessage = {
         id: makeId("m"),
@@ -499,94 +722,219 @@ export default function Home() {
   }
 
   return (
-    <div className={["flex flex-1 flex-col bg-zinc-50", isMobile ? "min-h-dvh" : ""].join(" ")}>
-      <header className="border-b border-zinc-200 bg-white">
+    <div className="flex min-h-dvh flex-1 flex-col bg-gradient-to-b from-slate-50 via-white to-zinc-100 font-sans text-zinc-900">
+      <header className="sticky top-0 z-10 border-b border-zinc-200/80 bg-white/85 backdrop-blur-md">
         <div
           className={[
-            "mx-auto flex w-full items-center justify-between px-4 py-3",
-            isMobile ? "max-w-md" : "max-w-3xl",
+            "mx-auto flex w-full max-w-full items-center justify-between gap-3 px-4 py-3.5",
+            isMobile ? "max-w-md" : "max-w-6xl",
           ].join(" ")}
         >
-          <div className="flex items-center gap-2">
-            <div className="text-sm font-semibold text-zinc-900">飞书 IM（Demo）</div>
+          <div className="flex min-w-0 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-2">
+            <div className="truncate text-sm font-semibold tracking-tight text-zinc-900">飞书 IM</div>
             <span
               className={[
-                "ml-1 rounded-full px-2 py-0.5 text-[11px] font-semibold",
-                isMobile ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100" : "bg-blue-50 text-blue-700 ring-1 ring-blue-100",
+                "w-fit rounded-md px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider",
+                isMobile
+                  ? "bg-emerald-500/10 text-emerald-700 ring-1 ring-emerald-500/20"
+                  : "bg-indigo-500/10 text-indigo-700 ring-1 ring-indigo-500/20",
               ].join(" ")}
             >
-              {isMobile ? "移动端" : "电脑端"}
+              {isMobile ? "移动" : "桌面"}
             </span>
           </div>
-          <div className="text-xs text-zinc-500">{isLoading ? "AI 正在输入…" : "就绪"}</div>
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {realtimeConfigured && conversationId ? (
+              <span
+                title={`会话 ${conversationId}`}
+                className="rounded-md bg-zinc-100/90 px-2 py-0.5 text-[10px] font-semibold text-zinc-600 ring-1 ring-zinc-200/80"
+              >
+                在线 · 桌{presenceCounts.desktop} 移{presenceCounts.mobile}
+              </span>
+            ) : null}
+            {effectiveTaskId ? (
+              <button
+                type="button"
+                title="从地址栏移除 taskId，并暂停用会话快照自动回填，便于连续测新任务"
+                className="rounded-md bg-white px-2 py-0.5 text-[10px] font-semibold text-zinc-600 ring-1 ring-zinc-200/80 transition hover:bg-zinc-50"
+                onClick={clearBoundTask}
+              >
+                解绑任务
+              </button>
+            ) : null}
+            <div
+              className={[
+                "rounded-md px-2 py-0.5 text-[10px] font-semibold ring-1",
+                isLoading
+                  ? "bg-amber-500/10 text-amber-800 ring-amber-500/20"
+                  : "bg-zinc-100 text-zinc-500 ring-zinc-200/80",
+              ].join(" ")}
+            >
+              {isLoading ? "处理中" : "就绪"}
+            </div>
+          </div>
         </div>
       </header>
 
       <main
         className={[
-          "mx-auto flex w-full flex-1 flex-col gap-3 overflow-auto px-4 py-4",
-          isMobile ? "max-w-md" : "max-w-3xl",
+          "mx-auto flex min-h-0 w-full flex-1 flex-col gap-4 px-3 py-3 sm:px-4 sm:py-4",
+          isMobile ? "max-w-md" : "max-w-6xl",
         ].join(" ")}
       >
-        {confirmRequest ? (
-          <section className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 shadow-sm">
-            <div className="font-semibold">需要确认</div>
-            <div className="mt-1 whitespace-pre-wrap">{confirmRequest.reason}</div>
-            <div className="mt-2 flex gap-2">
-              <button
-                className="rounded-xl bg-zinc-900 px-3 py-2 text-xs font-semibold text-zinc-50 hover:bg-zinc-800"
-                onClick={() => void onApprove()}
-              >
-                确认执行
-              </button>
-              <button
-                className="rounded-xl bg-white px-3 py-2 text-xs font-semibold text-zinc-900 ring-1 ring-zinc-200 hover:bg-zinc-50"
-                onClick={() => void onCancel()}
-              >
-                取消任务
-              </button>
-            </div>
-          </section>
-        ) : null}
-        {slidesRehearsalUrl ? (
-          <section className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900 shadow-sm">
-            <div className="font-semibold">飞书排练入口</div>
-            <div className="mt-1">演示稿已生成，可直接在飞书内放映/排练并继续修改。</div>
-            <div className="mt-2">
-              <a
-                href={slidesRehearsalUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex rounded-xl bg-emerald-700 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-600"
-              >
-                打开飞书PPT排练
-              </a>
-            </div>
-          </section>
-        ) : null}
-        <TaskPanel tasks={tasks} activeTaskId={activeTaskId} />
-        {messages.map((m) => (
-          <Bubble key={m.id} role={m.role} message={m} />
-        ))}
-        {isLoading ? (
-          <Bubble
-            role="assistant"
-            message={{ id: makeId("m"), role: "assistant", kind: "text", content: "…" }}
-          />
-        ) : null}
-        <div ref={bottomRef} />
-      </main>
-
-      <footer className="border-t border-zinc-200 bg-white">
         <div
           className={[
-            "mx-auto flex w-full gap-2 px-4 py-3",
-            isMobile ? "max-w-md" : "max-w-3xl",
+            "min-h-0 flex-1",
+            isMobile ? "space-y-3" : "grid grid-cols-[300px_minmax(0,1fr)] gap-4",
+          ].join(" ")}
+        >
+          <aside
+            className={[
+              "space-y-3",
+              isMobile ? "" : "max-h-full overflow-y-auto pr-1",
+            ].join(" ")}
+          >
+          {confirmRequest ? (
+            <section className="rounded-2xl border border-amber-200/90 bg-amber-50/90 p-4 text-sm text-amber-950 shadow-sm ring-1 ring-amber-100/80">
+              <div className="text-xs font-bold uppercase tracking-wide text-amber-800/90">需要确认</div>
+              <div className="mt-2 whitespace-pre-wrap leading-relaxed">{confirmRequest.reason}</div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  className="rounded-xl bg-zinc-900 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-zinc-800"
+                  onClick={() => void onApprove()}
+                >
+                  确认执行
+                </button>
+                <button
+                  className="rounded-xl bg-white px-4 py-2 text-xs font-semibold text-zinc-800 ring-1 ring-zinc-200/90 transition hover:bg-zinc-50"
+                  onClick={() => void onCancel()}
+                >
+                  取消任务
+                </button>
+              </div>
+            </section>
+          ) : null}
+          {slidesRehearsalUrl ? (
+            <section className="rounded-2xl border border-emerald-200/90 bg-emerald-50/90 p-4 text-sm text-emerald-950 shadow-sm ring-1 ring-emerald-100/80">
+              <div className="text-xs font-bold uppercase tracking-wide text-emerald-800/90">飞书排练</div>
+              <div className="mt-2 leading-relaxed text-emerald-900/90">演示稿已生成，可在飞书内放映或继续修改。</div>
+              <div className="mt-3">
+                <a
+                  href={slidesRehearsalUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-500"
+                >
+                  打开排练
+                </a>
+              </div>
+            </section>
+          ) : null}
+          <TaskPanel tasks={tasks} activeTaskId={activeTaskId} />
+          {feedbackEligibleTaskId && feedbackEligibleTaskId === effectiveTaskId ? (
+            <section className="rounded-2xl border border-zinc-200/90 bg-white p-3 text-xs text-zinc-700 shadow-sm ring-1 ring-zinc-100/80">
+              <div className="font-semibold text-zinc-800">本次任务结果是否有帮助？</div>
+              <textarea
+                value={feedbackNote}
+                onChange={(e) => setFeedbackNote(e.target.value.slice(0, 500))}
+                placeholder="附一句说明（可选，最多 500 字）"
+                rows={2}
+                disabled={feedbackSubmitting}
+                className="mt-2 block w-full resize-y rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none transition focus:border-zinc-400"
+              />
+              <div className="mt-2 flex flex-wrap gap-2">
+                {(["up", "down"] as const).map((rating) => (
+                  <button
+                    key={rating}
+                    type="button"
+                    disabled={feedbackSubmitting}
+                    className={
+                      rating === "up"
+                        ? "rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-60"
+                        : "rounded-lg bg-zinc-200 px-3 py-1.5 text-xs font-semibold text-zinc-800 transition hover:bg-zinc-300 disabled:opacity-60"
+                    }
+                    onClick={() =>
+                      void (async () => {
+                        const tid = feedbackEligibleTaskId;
+                        if (!tid || feedbackSubmitting) return;
+                        setFeedbackSubmitting(true);
+                        try {
+                          await fetch("/api/agent/feedback/rating", {
+                            method: "POST",
+                            headers: { "content-type": "application/json" },
+                            body: JSON.stringify({
+                              taskId: tid,
+                              conversationId,
+                              rating,
+                              note: feedbackNote,
+                            }),
+                          });
+                        } finally {
+                          setFeedbackSubmitting(false);
+                          setFeedbackNote("");
+                          setFeedbackEligibleTaskId(undefined);
+                        }
+                      })()
+                    }
+                  >
+                    {rating === "up" ? "有用" : "需改进"}
+                  </button>
+                ))}
+              </div>
+            </section>
+          ) : null}
+          {realtimeConfigured && conversationId ? <SharedMemo docId={conversationId} /> : null}
+          </aside>
+
+          <section
+            className={[
+              "flex min-h-[46dvh] flex-col rounded-2xl border border-zinc-200/70 bg-white/70 p-1 shadow-sm ring-1 ring-zinc-100/80 backdrop-blur-sm",
+              isMobile ? "" : "min-h-0 h-full",
+            ].join(" ")}
+          >
+          <div className="flex items-center justify-between px-3 pb-1 pt-2">
+            <span className="text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-400">对话</span>
+            {effectiveTaskId ? (
+              <span className="max-w-[55%] truncate font-mono text-[10px] text-zinc-400" title={effectiveTaskId}>
+                {effectiveTaskId.length > 18 ? `${effectiveTaskId.slice(0, 14)}…` : effectiveTaskId}
+              </span>
+            ) : null}
+          </div>
+          <div
+            className={[
+              "space-y-1 px-3 pb-3 pt-1",
+              isMobile ? "" : "min-h-0 flex-1 overflow-y-auto",
+            ].join(" ")}
+          >
+            {messages.map((m) =>
+              m.kind === "task_separator" ? (
+                <TaskRunDivider key={m.id} label={typeof m.content === "string" ? m.content : undefined} />
+              ) : (
+                <Bubble key={m.id} role={m.role} message={m} />
+              ),
+            )}
+            {isLoading ? (
+              <Bubble
+                role="assistant"
+                message={{ id: makeId("m"), role: "assistant", kind: "text", content: "…" }}
+              />
+            ) : null}
+            <div ref={bottomRef} />
+          </div>
+          </section>
+        </div>
+      </main>
+
+      <footer className="sticky bottom-0 z-10 mt-auto border-t border-zinc-200/80 bg-white/90 backdrop-blur-md">
+        <div
+          className={[
+            "mx-auto flex w-full max-w-full gap-2 px-4 py-3",
+            isMobile ? "max-w-md" : "max-w-6xl",
           ].join(" ")}
         >
           <textarea
-            className="min-h-[44px] max-h-32 flex-1 resize-none rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm outline-none focus:border-zinc-300 focus:ring-2 focus:ring-zinc-200"
-            placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+            className="min-h-[44px] max-h-32 flex-1 resize-none rounded-xl border border-zinc-200/90 bg-white px-3 py-2.5 text-sm text-zinc-900 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+            placeholder="输入消息 · Enter 发送 · Shift+Enter 换行"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -599,10 +947,10 @@ export default function Home() {
           />
           <button
             className={[
-              "h-[44px] shrink-0 rounded-xl px-4 text-sm font-semibold shadow-sm",
+              "h-[44px] shrink-0 rounded-xl px-5 text-sm font-semibold shadow-sm transition",
               canSend
-                ? "bg-zinc-900 text-zinc-50 hover:bg-zinc-800"
-                : "bg-zinc-200 text-zinc-500 cursor-not-allowed",
+                ? "bg-indigo-600 text-white hover:bg-indigo-500"
+                : "cursor-not-allowed bg-zinc-200 text-zinc-500",
             ].join(" ")}
             onClick={() => void onSend()}
             disabled={!canSend}

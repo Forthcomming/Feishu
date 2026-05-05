@@ -63,7 +63,7 @@ function isNoisyLine(line) {
     return true;
   }
   // Bot/system artifacts or delivery links.
-  if (/已收到指令，任务已启动|规划产物（预览）|任务已完成|同步到飞书失败/.test(s)) return true;
+  if (/已收到指令，任务已开始|已收到指令，任务已启动|规划产物（预览）|任务已完成|同步到飞书失败/.test(s)) return true;
   if (/https?:\/\/[^\s]+\/(?:docx|slides)\/[A-Za-z0-9]+/i.test(s)) return true;
   return false;
 }

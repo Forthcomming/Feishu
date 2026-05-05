@@ -79,6 +79,55 @@ export type TaskSnapshotPayload = {
   updatedAt: number;
 };
 
+export type Device = "desktop" | "mobile";
+
+export type PresenceEntry = { socketId: string; device: Device; joinedAt: number };
+
+export type ConversationSnapshotPayload = {
+  cid: string;
+  activeTaskId: string;
+  presence: PresenceEntry[];
+};
+
+export type ConversationTaskActiveEvent = {
+  eventType: "conversation.task_active";
+  conversationId: string;
+  taskId: string;
+  state: string;
+  at: number;
+};
+
+export type PresenceUpdatePayload = { cid: string; presence: PresenceEntry[] };
+
+export type TaskConfirmResolvedEvent = {
+  eventType: "task.confirm_resolved";
+  taskId: string;
+  stepId: string;
+  approved: boolean;
+  at: number;
+};
+
+export type BlocksConflictPayload = {
+  docId: string;
+  serverBlocks: Array<{ id: string; type: "title" | "text" | "list"; content: string }>;
+  serverVersion: number;
+};
+
+export type BlocksUpdatePayload = {
+  docId: string;
+  blocks: Array<{ id: string; type: "title" | "text" | "list"; content: string }>;
+  version: number;
+  serverTs: number;
+};
+
+export type BlocksAckPayload = { docId: string; version: number; serverTs: number };
+
+export type TasksConflictPayload = {
+  docId: string;
+  serverTasksState: TasksState;
+  serverVersion: number;
+};
+
 let socketSingleton: Socket | null = null;
 
 function getRealtimeUrl() {
@@ -102,6 +151,16 @@ export function getClientId() {
   return next;
 }
 
+function readDeviceFromUrl(): Device {
+  if (typeof window === "undefined") return "desktop";
+  try {
+    const p = new URLSearchParams(window.location.search);
+    return p.get("device") === "mobile" ? "mobile" : "desktop";
+  } catch {
+    return "desktop";
+  }
+}
+
 export function getSocket() {
   if (typeof window === "undefined") return null;
   if (socketSingleton) return socketSingleton;
@@ -112,6 +171,7 @@ export function getSocket() {
   socketSingleton = io(url, {
     transports: ["websocket"],
     autoConnect: true,
+    query: { device: readDeviceFromUrl(), clientId: getClientId() },
   });
 
   return socketSingleton;
@@ -178,9 +238,107 @@ export function onTaskConfirmRequired(handler: (p: TaskConfirmRequiredEvent) => 
   return () => s.off("task.confirm_required", handler);
 }
 
-export function emitTasksUpdate(docId: DocId, tasksState: TasksState) {
+export function emitTasksUpdate(docId: DocId, tasksState: TasksState, baseVersion?: number) {
   const s = getSocket();
   if (!s) return;
-  s.emit("tasks:update", { docId, tasksState, clientId: getClientId(), ts: Date.now() });
+  const payload: Record<string, unknown> = { docId, tasksState, clientId: getClientId(), ts: Date.now() };
+  if (typeof baseVersion === "number" && Number.isFinite(baseVersion)) payload.baseVersion = baseVersion;
+  s.emit("tasks:update", payload);
+}
+
+export function emitBlocksUpdate(
+  docId: DocId,
+  blocks: Array<{ id: string; type: "title" | "text" | "list"; content: string }>,
+  baseVersion?: number,
+) {
+  const s = getSocket();
+  if (!s) return;
+  const payload: Record<string, unknown> = { docId, blocks, clientId: getClientId(), ts: Date.now() };
+  if (typeof baseVersion === "number" && Number.isFinite(baseVersion)) payload.baseVersion = baseVersion;
+  s.emit("blocks:update", payload);
+}
+
+export function joinConversation(cid: string) {
+  const s = getSocket();
+  if (!s) return;
+  s.emit("conversation:join", { cid, clientId: getClientId() });
+}
+
+export function leaveConversation(cid: string) {
+  const s = getSocket();
+  if (!s) return;
+  s.emit("conversation:leave", { cid, clientId: getClientId() });
+}
+
+export function onConversationSnapshot(handler: (p: ConversationSnapshotPayload) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("conversation:snapshot", handler);
+  return () => s.off("conversation:snapshot", handler);
+}
+
+export function onConversationTaskActive(handler: (p: ConversationTaskActiveEvent) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("conversation.task_active", handler);
+  return () => s.off("conversation.task_active", handler);
+}
+
+export function onPresenceUpdate(handler: (p: PresenceUpdatePayload) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("presence:update", handler);
+  return () => s.off("presence:update", handler);
+}
+
+export function onTaskConfirmResolved(handler: (p: TaskConfirmResolvedEvent) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("task.confirm_resolved", handler);
+  return () => s.off("task.confirm_resolved", handler);
+}
+
+export function onBlocksUpdate(handler: (p: BlocksUpdatePayload) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("blocks:update", handler);
+  return () => s.off("blocks:update", handler);
+}
+
+export function onBlocksAck(handler: (p: BlocksAckPayload) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("blocks:ack", handler);
+  return () => s.off("blocks:ack", handler);
+}
+
+export function onBlocksConflict(handler: (p: BlocksConflictPayload) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("blocks:conflict", handler);
+  return () => s.off("blocks:conflict", handler);
+}
+
+export function onTasksConflict(handler: (p: TasksConflictPayload) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("tasks:conflict", handler);
+  return () => s.off("tasks:conflict", handler);
+}
+
+export type DocSnapshotPayload = {
+  docId: string;
+  blocks: Array<{ id: string; type: "title" | "text" | "list"; content: string }>;
+  blocksVersion: number;
+  tasksState: TasksState;
+  tasksVersion: number;
+  serverTs: number;
+};
+
+export function onDocSnapshot(handler: (p: DocSnapshotPayload) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("snapshot", handler);
+  return () => s.off("snapshot", handler);
 }
 

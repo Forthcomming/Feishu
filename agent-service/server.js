@@ -17,6 +17,8 @@ const {
 const { runLarkCli, tryParseJson } = require("./src/larkCliRunner");
 const { TaskStore } = require("./src/taskStore");
 const { AgentOrchestrator } = require("./src/orchestrator");
+const { publishFeedbackEvent, buildUserRatingFeedback } = require("./src/feedback");
+const { record: recordWorkflowFeedback, listRecent: listWorkflowFeedbackRecent } = require("./src/feedbackStore");
 
 const app = express();
 
@@ -72,6 +74,7 @@ function looksLikeBotAck(text) {
   const t = text.trim();
   if (!t) return false;
   return (
+    t.startsWith("已收到指令，任务已开始") ||
     t.startsWith("已收到指令，任务已启动：") ||
     t.startsWith("已生成NOTE：") ||
     t.startsWith("任务已完成，文档链接：") ||
@@ -202,6 +205,22 @@ async function publishTaskEvent(event) {
   }
 }
 
+async function publishConversationEvent(event) {
+  const realtimeUrl = env(
+    "REALTIME_CONVERSATION_PUBLISH_URL",
+    "http://localhost:3003/api/conversation-events",
+  );
+  try {
+    await fetch(realtimeUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(event),
+    });
+  } catch {
+    // 会话事件不可用时不阻断主流程。
+  }
+}
+
 const taskStore = new TaskStore();
 const orchestrator = new AgentOrchestrator({
   parseIntent,
@@ -216,7 +235,23 @@ const orchestrator = new AgentOrchestrator({
   tryParseJson,
   taskStore,
   publishTaskEvent,
+  publishFeedbackEvent,
 });
+
+function buildIntentMetaFromAnalyze(resolved) {
+  if (!resolved || typeof resolved !== "object") return null;
+  const v2 = resolved.parseIntentV2 && typeof resolved.parseIntentV2 === "object" ? resolved.parseIntentV2 : {};
+  return {
+    source: typeof resolved.source === "string" ? resolved.source : "",
+    decisionPath: typeof resolved.decisionPath === "string" ? resolved.decisionPath : "",
+    confidence: typeof resolved?.intent?.confidence === "number" ? resolved.intent.confidence : 0,
+    thresholds: resolved.thresholds && typeof resolved.thresholds === "object" ? resolved.thresholds : null,
+    output_type: typeof v2.output_type === "string" ? v2.output_type : "",
+    doc_type: typeof v2.doc_type === "string" ? v2.doc_type : "",
+    ppt_type: typeof v2.ppt_type === "string" ? v2.ppt_type : "",
+    scenario: typeof v2.scenario === "string" ? v2.scenario : "",
+  };
+}
 
 async function fetchRecentImContext({ chatId, identities, limit }) {
   const safeChatId = typeof chatId === "string" ? chatId.trim() : "";
@@ -348,7 +383,7 @@ app.post("/api/feishu/events", (req, res) => {
         const ackArgs = buildImMessagesSendArgs({
           as: defaultIdentity,
           chatId,
-          text: `已收到指令，任务已启动：${taskId}`,
+          text: "已收到指令，任务已开始",
           dryRun,
         });
         await runLarkCli(ackArgs, { timeoutMs: 30_000 });
@@ -357,7 +392,7 @@ app.post("/api/feishu/events", (req, res) => {
       }
 
       try {
-        await orchestrator.startWorkflow({
+        const task = await orchestrator.startWorkflow({
           taskId,
           conversationId: chatId,
           input: `${text}${contextBlock}`,
@@ -367,6 +402,14 @@ app.post("/api/feishu/events", (req, res) => {
           targetArtifacts: Array.isArray(intent?.slots?.targetArtifacts) ? intent.slots.targetArtifacts : ["doc"],
           delivery: { channel: "im_chat", chatId },
           execution: { dryRun, defaultIdentity, docIdentity: "user", slidesIdentity: "user" },
+          intentMeta: buildIntentMetaFromAnalyze(intent),
+        });
+        void publishConversationEvent({
+          eventType: "conversation.task_active",
+          conversationId: task?.conversationId || chatId,
+          taskId: task?.taskId || taskId,
+          state: task?.state || "detecting",
+          at: Date.now(),
         });
       } catch (e) {
         // If orchestration fails fast, report to IM for easier debugging.
@@ -543,6 +586,15 @@ app.post("/api/agent/workflow/start", async (req, res) => {
       targetArtifacts: explicitArtifacts || inferredArtifacts,
       delivery,
       execution,
+      intentMeta: buildIntentMetaFromAnalyze(resolvedIntent),
+    });
+
+    void publishConversationEvent({
+      eventType: "conversation.task_active",
+      conversationId: task.conversationId,
+      taskId: task.taskId,
+      state: task.state,
+      at: Date.now(),
     });
 
     res.json({
@@ -620,7 +672,43 @@ app.post("/api/agent/workflow/confirm", (req, res) => {
   const override = body.override && typeof body.override === "object" ? body.override : null;
   // Idempotent-ish: if waiter already resolved, return accepted anyway.
   taskStore.resolveConfirm(taskId, stepId, approved, override);
+  void publishTaskEvent({
+    eventType: "task.confirm_resolved",
+    taskId,
+    stepId,
+    approved,
+    at: Date.now(),
+  });
   res.json({ ok: true, taskId, stepId, accepted: approved });
+});
+
+app.post("/api/agent/feedback/rating", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const taskId = typeof body.taskId === "string" ? body.taskId.trim() : "";
+    const conversationId = typeof body.conversationId === "string" ? body.conversationId.trim() : "";
+    const ratingRaw = typeof body.rating === "string" ? body.rating.trim() : "";
+    if (!taskId) {
+      res.status(400).json({ ok: false, error: "taskId is required" });
+      return;
+    }
+    if (ratingRaw !== "up" && ratingRaw !== "down") {
+      res.status(400).json({ ok: false, error: "rating must be 'up' or 'down'" });
+      return;
+    }
+    const event = buildUserRatingFeedback({
+      taskId,
+      conversationId,
+      artifactId: typeof body.artifactId === "string" ? body.artifactId : "",
+      rating: ratingRaw,
+      note: typeof body.note === "string" ? body.note : "",
+      tags: Array.isArray(body.tags) ? body.tags : [],
+    });
+    void publishFeedbackEvent(event);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e && e.message ? e.message : String(e) });
+  }
 });
 
 app.post("/api/agent/workflow/cancel", (req, res) => {
@@ -638,6 +726,13 @@ app.post("/api/agent/workflow/cancel", (req, res) => {
   taskStore.cancel(taskId);
   taskStore.update(taskId, { state: "cancelled", currentStepId: null });
   void publishTaskEvent({ eventType: "task.state", taskId, state: "cancelled", at: Date.now() });
+  void publishTaskEvent({
+    eventType: "task.confirm_resolved",
+    taskId,
+    stepId: "",
+    approved: false,
+    at: Date.now(),
+  });
   res.json({ ok: true, taskId });
 });
 
@@ -663,6 +758,28 @@ app.get("/api/agent/workflow/:taskId", (req, res) => {
 });
 
 // For Feishu-triggered workflows: allow GUI to discover latest taskId by conversationId(chatId).
+app.post("/api/agent/workflow/feedback", (req, res) => {
+  const body = req.body || {};
+  const taskId = typeof body.taskId === "string" ? body.taskId.trim() : "";
+  const rating = body.rating === "up" || body.rating === "down" ? body.rating : "";
+  if (!taskId || !rating) {
+    res.status(400).json({ ok: false, error: "taskId and rating (up|down) are required" });
+    return;
+  }
+  recordWorkflowFeedback({
+    taskId,
+    rating,
+    comment: typeof body.comment === "string" ? body.comment : "",
+    at: Date.now(),
+  });
+  res.json({ ok: true, taskId, rating });
+});
+
+app.get("/api/agent/workflow/feedback/recent", (req, res) => {
+  const lim = req.query && req.query.limit != null ? Number(req.query.limit) : 20;
+  res.json({ ok: true, items: listWorkflowFeedbackRecent(lim) });
+});
+
 app.get("/api/agent/conversation/:conversationId/latest-task", (req, res) => {
   const conversationId = typeof req.params.conversationId === "string" ? req.params.conversationId.trim() : "";
   if (!conversationId) {

@@ -3,6 +3,21 @@ const { confirmRequiredEvent } = require("./taskEvents");
 const { generateContentBundle } = require("./contentAgent");
 const { generateSlidesXmlArray } = require("./contentAgent");
 const { resolveDocTemplate, resolveSlidesTemplate } = require("./intentTemplates");
+const { buildTaskCompletedFeedback, publishFeedbackEvent: defaultPublishFeedbackEvent } = require("./feedback");
+const { readContentConfidenceMin, aggregateContentConfidence } = require("./contentConfidenceGate");
+
+function sleep(ms) {
+  const n = Number(ms);
+  const delay = Number.isFinite(n) && n > 0 ? Math.min(n, 30_000) : 0;
+  return delay ? new Promise((r) => setTimeout(r, delay)) : Promise.resolve();
+}
+
+function readReflectingPhaseMs() {
+  const raw = process.env.REFLECTING_PHASE_MS;
+  if (raw == null || String(raw).trim() === "") return 250;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.min(10_000, Math.max(0, Math.floor(n))) : 250;
+}
 
 function makeStep(stepId, label) {
   return { stepId, label, status: "pending" };
@@ -291,10 +306,33 @@ class AgentOrchestrator {
     this.tryParseJson = deps.tryParseJson;
     this.taskStore = deps.taskStore;
     this.publishTaskEvent = deps.publishTaskEvent;
+    this.publishFeedbackEvent = deps.publishFeedbackEvent || defaultPublishFeedbackEvent;
   }
 
   async emit(event) {
     await this.publishTaskEvent(event);
+  }
+
+  async emitTaskCompletedFeedback({ taskId, input, capturedIntent, capturedTemplate, startedAt }) {
+    if (typeof this.publishFeedbackEvent !== "function") return;
+    try {
+      const finalTask = this.taskStore.get(taskId);
+      if (!finalTask) return;
+      const intentMeta = {
+        ...(capturedIntent && typeof capturedIntent === "object" ? capturedIntent : {}),
+        ...(input && input.intentMeta && typeof input.intentMeta === "object" ? input.intentMeta : {}),
+      };
+      const event = buildTaskCompletedFeedback({
+        task: finalTask,
+        input: input || {},
+        intentMeta,
+        templateInfo: capturedTemplate || {},
+        startedAt,
+      });
+      await this.publishFeedbackEvent(event);
+    } catch {
+      // never block main flow on feedback failures
+    }
   }
 
   updateStep(task, stepId, status) {
@@ -334,10 +372,14 @@ class AgentOrchestrator {
   async runWorkflow(taskId, input) {
     let task = this.taskStore.get(taskId);
     if (!task) return;
+    const startedAt = Date.now();
+    let capturedIntent = null;
+    let capturedTemplate = null;
     try {
       if (this.taskStore.isCancelled(taskId)) {
         this.taskStore.update(taskId, { state: "cancelled", currentStepId: null });
         await this.emit(stateEvent(taskId, "cancelled"));
+        await this.emitTaskCompletedFeedback({ taskId, input, capturedIntent, capturedTemplate, startedAt });
         return;
       }
       task = this.taskStore.update(taskId, { state: "intent" });
@@ -349,6 +391,7 @@ class AgentOrchestrator {
         contextSummary: input.contextSummary || "",
         recentMessages: Array.isArray(input.recentMessages) ? input.recentMessages : [],
       });
+      capturedIntent = intent;
       task = this.updateStep(task, "step_extract_intent", "completed");
       await this.emit(stepEvent(taskId, task.steps.find((s) => s.stepId === "step_extract_intent")));
 
@@ -424,6 +467,8 @@ class AgentOrchestrator {
       let docUrl = "";
       let contentBundle = null;
       let emittedContentArtifact = false;
+      let contentPreviewOnly = false;
+      let emittedConfidenceGateNote = false;
       const ensureBundle = async () => {
         if (contentBundle) return contentBundle;
         contentBundle = await this.generateContentBundle({
@@ -432,6 +477,27 @@ class AgentOrchestrator {
           targetArtifacts: input.targetArtifacts || [],
           intent,
         });
+
+        const minConf = readContentConfidenceMin();
+        if (minConf != null) {
+          const agg = aggregateContentConfidence(contentBundle, wantsSlides);
+          if (agg < minConf) {
+            contentPreviewOnly = true;
+            if (!emittedConfidenceGateNote) {
+              emittedConfidenceGateNote = true;
+              const thr = String(minConf);
+              const gateNote = {
+                artifactId: `note_conf_gate_${Date.now()}`,
+                kind: "note",
+                title:
+                  `提示：内容综合置信度低于阈值（CONTENT_CONFIDENCE_MIN=${thr}），本次仅保留「规划产物」预览，已跳过飞书文档/演示稿写入与 IM 交付消息。`,
+                url: "",
+              };
+              task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, gateNote] });
+              await this.emit(artifactEvent(taskId, gateNote));
+            }
+          }
+        }
 
         // Emit a human-readable artifact so the frontend can show intermediate results
         // without requiring users to open the generated doc.
@@ -506,6 +572,7 @@ class AgentOrchestrator {
             if (!confirm?.approved) {
               this.taskStore.update(taskId, { state: "cancelled", currentStepId: null });
               await this.emit(stateEvent(taskId, "cancelled"));
+              await this.emitTaskCompletedFeedback({ taskId, input, capturedIntent, capturedTemplate, startedAt });
               return;
             }
             if (confirm.override) {
@@ -515,63 +582,81 @@ class AgentOrchestrator {
         } else if (s.stepId === "step_summarize_context" || s.stepId === "step_extract_requirements" || s.stepId === "step_identify_open_questions" || s.stepId === "step_make_outline") {
           await ensureBundle();
         } else if (s.stepId === "step_create_doc" && wantsDoc) {
-          const b = await ensureBundle().catch(() => null);
-          const summaryMd = b?.summaryMd ? String(b.summaryMd).trim() : "";
-          const requirementsMd = b?.requirementsMd ? String(b.requirementsMd).trim() : "";
-          const clarifyMd = b?.clarifyMd ? String(b.clarifyMd).trim() : "";
-          const outlineMd = b?.outlineMd ? String(b.outlineMd).trim() : "";
+          const b = await ensureBundle();
+          if (!contentPreviewOnly) {
+            const summaryMd = b?.summaryMd ? String(b.summaryMd).trim() : "";
+            const requirementsMd = b?.requirementsMd ? String(b.requirementsMd).trim() : "";
+            const clarifyMd = b?.clarifyMd ? String(b.clarifyMd).trim() : "";
+            const outlineMd = b?.outlineMd ? String(b.outlineMd).trim() : "";
           const rewrittenMd = b?.rewrittenMd ? String(b.rewrittenMd).trim() : "";
           const docTpl = resolveDocTemplate(intent);
-          const fallbackBody = [summaryMd, requirementsMd, clarifyMd, outlineMd].filter(Boolean).join("\n\n").trim();
-          const bodyMd = rewrittenMd || fallbackBody || "## 内容\n- （暂无）";
-          const docMarkdown = ["# " + docTpl.h1, "", bodyMd].join("\n\n");
-          const docTarget = pickDocTargetFromInput(input.input);
-          const canUpdate = Boolean(docTarget && typeof this.buildDocsUpdateArgs === "function");
-
-          if (canUpdate) {
-            const updateMarkdown = [
-              "",
-              `## 本次更新（${new Date().toISOString().slice(0, 19).replace("T", " ")}）`,
-              "",
-              bodyMd,
-            ].join("\n");
-            const docArgs = this.buildDocsUpdateArgs({
-              as: input.execution?.docIdentity ?? input.execution?.defaultIdentity ?? execIdentity,
-              doc: docTarget,
-              apiVersion: "v2",
-              mode: "append",
-              markdown: updateMarkdown,
-              dryRun: input.execution?.dryRun ?? execDryRun,
-            });
-            const docResp = await this.runLarkCli(docArgs, { timeoutMs: 120_000, stdin: updateMarkdown });
-            const parsedDoc = this.tryParseJson(docResp.stdout);
-            docUrl =
-              pickDocsCreateUrl(parsedDoc.ok ? parsedDoc.value : null) ||
-              pickDocUrlFromText(docResp.stdout) ||
-              (docTarget.startsWith("http") ? docTarget : "");
-          } else {
-            const docArgs = this.buildDocsCreateArgs({
-              as: input.execution?.docIdentity ?? input.execution?.defaultIdentity ?? execIdentity,
-              title: docTpl.title,
-              apiVersion: "v2",
-              markdown: docMarkdown,
-              dryRun: input.execution?.dryRun ?? execDryRun,
-            });
-            const docResp = await this.runLarkCli(docArgs, { timeoutMs: 120_000, stdin: docMarkdown });
-            const parsedDoc = this.tryParseJson(docResp.stdout);
-            docUrl = pickDocsCreateUrl(parsedDoc.ok ? parsedDoc.value : null) || pickDocUrlFromText(docResp.stdout) || "";
-          }
-          const artifact = {
-            artifactId: `doc_${Date.now()}`,
+          capturedTemplate = {
             kind: "doc",
-            title: docTpl.title.replace("（Agent）", ""),
-            url: docUrl,
+            title: docTpl.title,
+            sectionsOrder: Array.isArray(docTpl.sectionsOrder) ? docTpl.sectionsOrder : [],
           };
-          task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, artifact] });
-          await this.emit(artifactEvent(taskId, artifact));
+            const fallbackBody = [summaryMd, requirementsMd, clarifyMd, outlineMd].filter(Boolean).join("\n\n").trim();
+            const bodyMd = rewrittenMd || fallbackBody || "## 内容\n- （暂无）";
+            const docMarkdown = ["# " + docTpl.h1, "", bodyMd].join("\n\n");
+            const docTarget = pickDocTargetFromInput(input.input);
+            const canUpdate = Boolean(docTarget && typeof this.buildDocsUpdateArgs === "function");
+
+            if (canUpdate) {
+              const updateMarkdown = [
+                "",
+                `## 本次更新（${new Date().toISOString().slice(0, 19).replace("T", " ")}）`,
+                "",
+                bodyMd,
+              ].join("\n");
+              const docArgs = this.buildDocsUpdateArgs({
+                as: input.execution?.docIdentity ?? input.execution?.defaultIdentity ?? execIdentity,
+                doc: docTarget,
+                apiVersion: "v2",
+                mode: "append",
+                markdown: updateMarkdown,
+                dryRun: input.execution?.dryRun ?? execDryRun,
+              });
+              const docResp = await this.runLarkCli(docArgs, { timeoutMs: 120_000, stdin: updateMarkdown });
+              const parsedDoc = this.tryParseJson(docResp.stdout);
+              docUrl =
+                pickDocsCreateUrl(parsedDoc.ok ? parsedDoc.value : null) ||
+                pickDocUrlFromText(docResp.stdout) ||
+                (docTarget.startsWith("http") ? docTarget : "");
+            } else {
+              const docArgs = this.buildDocsCreateArgs({
+                as: input.execution?.docIdentity ?? input.execution?.defaultIdentity ?? execIdentity,
+                title: docTpl.title,
+                apiVersion: "v2",
+                markdown: docMarkdown,
+                dryRun: input.execution?.dryRun ?? execDryRun,
+              });
+              const docResp = await this.runLarkCli(docArgs, { timeoutMs: 120_000, stdin: docMarkdown });
+              const parsedDoc = this.tryParseJson(docResp.stdout);
+              docUrl = pickDocsCreateUrl(parsedDoc.ok ? parsedDoc.value : null) || pickDocUrlFromText(docResp.stdout) || "";
+            }
+            const artifact = {
+              artifactId: `doc_${Date.now()}`,
+              kind: "doc",
+              title: docTpl.title.replace("（Agent）", ""),
+              url: docUrl,
+            };
+            task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, artifact] });
+            await this.emit(artifactEvent(taskId, artifact));
+          }
         } else if (s.stepId === "step_create_slides" && wantsSlides) {
-          const b = await ensureBundle().catch(() => null);
+          // 必须 await 真实错误：若 .catch(() => null) 会得到 b=null，随后 generateSlidesXmlArray 只报 misleading 的 missing rewrittenSlidesPlan
+          const b = await ensureBundle();
+          if (contentPreviewOnly) {
+            // skip Feishu slides writes (preview-only gate)
+          } else {
           const slidesTpl = resolveSlidesTemplate(intent);
+          if (!capturedTemplate) {
+            capturedTemplate = {
+              kind: "slides",
+              title: slidesTpl.deckTitle,
+              sectionsOrder: Array.isArray(slidesTpl.sectionsOrder) ? slidesTpl.sectionsOrder : [],
+            };
+          }
           const slidesTitle = slidesTpl.deckTitle;
           const slidesXmlArray = generateSlidesXmlArray({ bundle: b, text: input.input, intent });
           let usedFallbackEmptySlides = false;
@@ -704,8 +789,9 @@ class AgentOrchestrator {
             task = this.taskStore.update(taskId, { artifacts: [...task.artifacts, hint] });
             await this.emit(artifactEvent(taskId, hint));
           }
+          }
         } else if (s.stepId === "step_send_delivery_message") {
-          if (input.delivery?.chatId) {
+          if (input.delivery?.chatId && !contentPreviewOnly) {
             const slides = task.artifacts.find((a) => a.kind === "slides");
             const docLink = typeof docUrl === "string" ? docUrl.trim() : "";
             const slidesLink = typeof slides?.url === "string" ? slides.url.trim() : "";
@@ -735,6 +821,13 @@ class AgentOrchestrator {
 
       this.taskStore.update(taskId, { state: "completed", currentStepId: null });
       await this.emit(stateEvent(taskId, "completed"));
+      await this.emitTaskCompletedFeedback({ taskId, input, capturedIntent, capturedTemplate, startedAt });
+
+      this.taskStore.update(taskId, { state: "reflecting", currentStepId: null });
+      await this.emit(stateEvent(taskId, "reflecting"));
+      await sleep(readReflectingPhaseMs());
+      this.taskStore.update(taskId, { state: "idle", currentStepId: null });
+      await this.emit(stateEvent(taskId, "idle"));
     } catch (err) {
       const rawMsg = err && err.message ? err.message : String(err);
       const msg = normalizeErrorMessage(rawMsg);
@@ -761,6 +854,7 @@ class AgentOrchestrator {
         // ignore
       }
       await this.emit(stateEvent(taskId, "failed"));
+      await this.emitTaskCompletedFeedback({ taskId, input, capturedIntent, capturedTemplate, startedAt });
     }
   }
 }

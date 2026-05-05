@@ -75,6 +75,37 @@ function resolveDocTemplate(intent) {
   };
 }
 
+// 飞书 SML：渐变须用 rgba + 百分比停靠点（与 lark-slides xml-schema-quick-ref 一致）
+const VISUAL_THEMES = Object.freeze({
+  review: {
+    coverBg: "linear-gradient(135deg,rgba(15,23,42,1) 0%,rgba(56,97,140,1) 100%)",
+    contentBg: "rgb(248,250,252)",
+    closingBg: "linear-gradient(135deg,rgba(30,41,59,1) 0%,rgba(71,85,105,1) 100%)",
+    accentRgb: "rgb(59,130,246)",
+    onDark: "rgb(255,255,255)",
+    onLightTitle: "rgb(15,23,42)",
+    onLightBody: "rgb(30,41,59)",
+  },
+  report: {
+    coverBg: "linear-gradient(135deg,rgba(30,60,114,1) 0%,rgba(59,130,246,1) 100%)",
+    contentBg: "rgb(248,250,252)",
+    closingBg: "linear-gradient(135deg,rgba(30,60,114,1) 0%,rgba(45,90,180,1) 100%)",
+    accentRgb: "rgb(59,130,246)",
+    onDark: "rgb(255,255,255)",
+    onLightTitle: "rgb(30,60,114)",
+    onLightBody: "rgb(15,23,42)",
+  },
+  proposal: {
+    coverBg: "linear-gradient(135deg,rgba(88,28,135,1) 0%,rgba(190,24,93,1) 100%)",
+    contentBg: "rgb(255,255,255)",
+    closingBg: "linear-gradient(135deg,rgba(88,28,135,1) 0%,rgba(157,23,77,1) 100%)",
+    accentRgb: "rgb(168,85,247)",
+    onDark: "rgb(255,255,255)",
+    onLightTitle: "rgb(88,28,135)",
+    onLightBody: "rgb(51,65,85)",
+  },
+});
+
 function resolveSlidesTemplate(intent) {
   const i = safeIntent(intent);
   const typeToDeck = {
@@ -90,10 +121,13 @@ function resolveSlidesTemplate(intent) {
     proposal: ["机会与目标", "提案概述", "实施方案", "收益评估", "风险与备选", "里程碑与资源"],
   };
 
+  const visualTheme = VISUAL_THEMES[i.ppt_type] || VISUAL_THEMES.report;
+
   return {
     deckTitle: `${deckBase}（Agent）`,
     coverTitle: `${deckBase}（${i.scenario}）`,
     sectionOutline: outlineByType[i.ppt_type] || outlineByType.report,
+    visualTheme,
   };
 }
 

@@ -4,6 +4,7 @@ function envOptional(name) {
 }
 
 const { resolveDocTemplate, resolveSlidesTemplate } = require("./intentTemplates");
+const { buildSlideXml, slideRoleForIndex } = require("./slideTemplates");
 const { restructureContent, evaluateDocQuality } = require("./contentRestructure");
 const { callChatCompletions } = require("./llmChat");
 
@@ -139,40 +140,6 @@ function pickSlideLinesFromMarkdown(md, max) {
   return lines.slice(0, max);
 }
 
-function escapeXml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function buildSlideXml({ title, bullets }) {
-  // lark-cli slides +create expects SML(2.0) slide XML, not custom tags.
-  // Minimal safe template: background + 2 text shapes (title/body) with <p>/<ul>/<li>.
-  const safeTitle = escapeXml(title || "未命名");
-  const safeBullets = (Array.isArray(bullets) ? bullets : [])
-    .map((x) => escapeXml(x))
-    .filter(Boolean)
-    .slice(0, 6);
-  const list = safeBullets.map((x) => `<li><p>${x}</p></li>`).join("");
-  const body = list ? `<ul>${list}</ul>` : `<p>（暂无要点）</p>`;
-  return (
-    `<slide xmlns="http://www.larkoffice.com/sml/2.0">` +
-    `<style><fill><fillColor color="rgb(245,245,245)"/></fill></style>` +
-    `<data>` +
-    `<shape type="text" topLeftX="80" topLeftY="70" width="800" height="100">` +
-    `<content textType="title"><p>${safeTitle}</p></content>` +
-    `</shape>` +
-    `<shape type="text" topLeftX="80" topLeftY="180" width="800" height="320">` +
-    `<content textType="body">${body}</content>` +
-    `</shape>` +
-    `</data>` +
-    `</slide>`
-  );
-}
-
 function chunk(arr, size) {
   const out = [];
   const n = Number.isFinite(size) && size > 0 ? Math.floor(size) : 5;
@@ -268,11 +235,15 @@ function generateSlidesXmlArray({ bundle, text, intent }) {
   const rewrittenPlan = b?.rewrittenSlidesPlan;
   if (rewrittenPlan && typeof rewrittenPlan === "object") {
     const slides = Array.isArray(rewrittenPlan.slides) ? rewrittenPlan.slides : [];
+    const n = slides.length;
+    const visualTheme = slidesTemplate.visualTheme;
     const xml = [];
-    for (const s of slides) {
+    for (let i = 0; i < slides.length; i += 1) {
+      const s = slides[i];
       const title = normalizeSlideText(s?.title) || "未命名";
       const bulletsArr = Array.isArray(s?.bullets) ? s.bullets.map(normalizeSlideText).filter(Boolean) : [];
-      xml.push(buildSlideXml({ title, bullets: bulletsArr.slice(0, 6) }));
+      const role = slideRoleForIndex(i, n);
+      xml.push(buildSlideXml({ title, bullets: bulletsArr.slice(0, 6), role, visualTheme }));
     }
     return xml.slice(0, 10);
   }
@@ -298,18 +269,25 @@ function generateSlidesXmlArray({ bundle, text, intent }) {
   const all = core.length > 0 ? core : fallbackLines;
   const groups = chunk(all, 5).slice(0, 8);
 
+  const visualTheme = slidesTemplate.visualTheme;
   const slides = [];
+  const coverBullets = all.slice(0, 4).length > 0 ? all.slice(0, 4) : ["根据讨论内容自动生成"];
   slides.push(
     buildSlideXml({
       title: slidesTemplate.coverTitle,
-      bullets: all.slice(0, 4).length > 0 ? all.slice(0, 4) : ["根据讨论内容自动生成"],
+      bullets: coverBullets,
+      role: "cover",
+      visualTheme,
     }),
   );
   const sectionTitles = Array.isArray(slidesTemplate.sectionOutline) ? slidesTemplate.sectionOutline : [];
+  const totalPlanned = 1 + groups.length;
   for (let i = 0; i < groups.length; i += 1) {
     const g = groups[i];
     const title = sectionTitles[i] ? sectionTitles[i] : `核心要点 ${i + 1}`;
-    slides.push(buildSlideXml({ title, bullets: g }));
+    const idx = i + 1;
+    const role = slideRoleForIndex(idx, totalPlanned);
+    slides.push(buildSlideXml({ title, bullets: g, role, visualTheme }));
   }
   return slides.slice(0, 10);
 }

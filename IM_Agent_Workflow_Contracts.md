@@ -122,7 +122,8 @@
 
 ## 2.1 频道规则
 - 任务频道：`task:{taskId}`
-- 会话频道：`conversation:{conversationId}`
+- 会话频道：`conversation:{conversationId}`（多端一致性：承载 presence 与 `conversation.task_active` 广播）
+- 文档频道：`doc:{docId}`（协同编辑：承载 `blocks:update / blocks:conflict / blocks:ack` 与 `tasks:update / tasks:conflict / tasks:ack`）
 
 ## 2.2 事件定义（最小集合）
 
@@ -196,6 +197,73 @@
     "retryable": true
   },
   "at": 1760000004000
+}
+```
+
+### `task.confirm_resolved`
+
+任一端点击"确认执行"或"取消任务"后，后端向 `task:{taskId}` 广播该事件，其它端据此清除本地确认弹窗，避免 UI 残留。
+
+```json
+{
+  "eventType": "task.confirm_resolved",
+  "taskId": "task_7f5c",
+  "stepId": "step_send_delivery_message",
+  "approved": true,
+  "at": 1760000005000
+}
+```
+
+### `conversation.task_active`
+
+`POST /api/agent/workflow/start` 成功后，`agent-service` 向 `realtime-server` 的 `POST /api/conversation-events` 推送此事件；realtime-server 广播到 `conversation:{conversationId}` 房间，订阅端自动切换到新任务，无需轮询 `/latest-task`。
+
+```json
+{
+  "eventType": "conversation.task_active",
+  "conversationId": "oc_xxx",
+  "taskId": "task_7f5c",
+  "state": "detecting",
+  "at": 1760000006000
+}
+```
+
+### `conversation:snapshot` / `presence:update`
+
+客户端 `emit("conversation:join", { cid })` 加入会话房间后，服务端回 `conversation:snapshot`（含当前活跃任务与在线端列表）。成员进出会话房间时向同房间广播 `presence:update`。
+
+```json
+{
+  "cid": "oc_xxx",
+  "activeTaskId": "task_7f5c",
+  "presence": [
+    { "socketId": "s1", "device": "desktop", "joinedAt": 1760000007000 },
+    { "socketId": "s2", "device": "mobile",  "joinedAt": 1760000007200 }
+  ]
+}
+```
+
+### `blocks:update` / `blocks:conflict` / `blocks:ack`（乐观锁）
+
+文档内容采用"带基版本的乐观并发控制（CAS）"。客户端 `emit("blocks:update", { docId, blocks, baseVersion })`：若 `baseVersion == 服务器当前 version` 则 `version + 1` 并广播新版本；否则仅向发起方回 `blocks:conflict`，请用户手动解决。`tasks:update` / `tasks:conflict` / `tasks:ack` 同构。
+
+```json
+// blocks:update（服务端广播给房间其它成员）
+{
+  "docId": "oc_xxx",
+  "blocks": [{ "id": "memo", "type": "text", "content": "..." }],
+  "version": 12,
+  "serverTs": 1760000008000
+}
+
+// blocks:ack（服务端回发给发起方）
+{ "docId": "oc_xxx", "version": 12, "serverTs": 1760000008000 }
+
+// blocks:conflict（服务端仅回发给失败一方）
+{
+  "docId": "oc_xxx",
+  "serverBlocks": [{ "id": "memo", "type": "text", "content": "..." }],
+  "serverVersion": 12
 }
 ```
 
