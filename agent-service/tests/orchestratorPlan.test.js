@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { AgentOrchestrator } = require("../src/orchestrator");
 const { TaskStore } = require("../src/taskStore");
 const { planWorkflow } = require("../src/plannerAgent");
+const { resolveEditIntentRuleOnly } = require("./orchestratorResolveRule");
 
 function makeDeps({ events }) {
   let lastSlidesCreateInput = null;
@@ -92,6 +93,7 @@ function makeDeps({ events }) {
     },
     getLastSlidesCreateInput: () => lastSlidesCreateInput,
     getCalls: () => calls,
+    resolveEditIntent: resolveEditIntentRuleOnly,
   };
 }
 

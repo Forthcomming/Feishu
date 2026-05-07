@@ -24,7 +24,7 @@ function extractDocUrl(text) {
 }
 
 function extractSlidesUrl(text) {
-  const m = String(text || "").match(/https?:\/\/[^\s]+\/slides\/[A-Za-z0-9]+/);
+  const m = String(text || "").match(/https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9_-]+/);
   return m ? m[0] : "";
 }
 

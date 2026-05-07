@@ -19,6 +19,7 @@ import {
   onTaskConfirmRequired,
   onTaskConfirmResolved,
   onTaskError,
+  onTaskFeedbackSubmitted,
   onTaskSnapshot,
   onTaskState,
   onTaskStep,
@@ -29,6 +30,7 @@ import {
   type TaskArtifactEvent,
   type TaskConfirmRequiredEvent,
   type TaskErrorEvent,
+  type TaskFeedbackSubmittedEvent,
   type TaskSnapshotPayload,
   type TaskStateEvent,
   type TaskStepEvent,
@@ -88,9 +90,29 @@ function isWorkflowKeyword(text: string) {
   const t = text.trim();
   if (!t) return false;
   const hasDocRef = /(?:https?:\/\/[^\s"']+\/docx\/[A-Za-z0-9]+)|(?:docx\/[A-Za-z0-9]+)/.test(t);
-  const hasSlidesRef = /(?:https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9]+)|(?:slides\/[A-Za-z0-9]+)/.test(t);
-  const wantsEdit = /(更新|修改|补充|替换|继续|第\s*\d+\s*页|页码\s*\d+)/.test(t);
+  const hasSlidesRef = /(?:https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9_-]+)|(?:slides\/[A-Za-z0-9_-]+)/.test(t);
+  // 与 agent-service editIntentParser 常见编辑动词对齐；缺「插入」等会导致带 docx 链接的插入指令只走 stub、不启动 workflow。
+  const wantsEdit =
+    /(更新|修改|补充|替换|继续|插入|新增|添加|删掉|删去|删除|去掉|移除|润色|重写|精简|压缩|改成|改为|第\s*\d+\s*页|页码\s*\d+)/.test(
+      t,
+    );
   return t.includes("生成PPT") || t.includes("需求文档") || (hasDocRef && wantsEdit) || (hasSlidesRef && wantsEdit);
+}
+
+const TERMINAL_TASK_STATES = new Set(["completed", "failed", "cancelled", "idle"]);
+
+async function isTerminalTask(taskId: string): Promise<boolean> {
+  const safeTaskId = String(taskId || "").trim();
+  if (!safeTaskId) return true;
+  try {
+    const resp = await fetch(`/api/agent/workflow/task/${encodeURIComponent(safeTaskId)}`, { cache: "no-store" });
+    if (!resp.ok) return false;
+    const payload = (await resp.json()) as { ok?: boolean; task?: { state?: string } };
+    const state = typeof payload?.task?.state === "string" ? payload.task.state.trim() : "";
+    return TERMINAL_TASK_STATES.has(state);
+  } catch {
+    return false;
+  }
 }
 
 function TaskRunDivider({ label }: { label?: string }) {
@@ -127,6 +149,22 @@ function Bubble({ role, message }: { role: ChatRole; message: ChatMessage }) {
   );
 }
 
+function removeTaskIdFromCurrentUrl() {
+  if (typeof window === "undefined") return;
+  try {
+    const next = new URLSearchParams(window.location.search);
+    next.delete("taskId");
+    const qs = next.toString();
+    window.history.replaceState(null, "", qs ? `/?${qs}` : "/");
+  } catch {
+    // ignore
+  }
+}
+
+function isCancelledState(state: unknown): boolean {
+  return typeof state === "string" && state.trim() === "cancelled";
+}
+
 export default function Home() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -156,9 +194,13 @@ export default function Home() {
   const [presence, setPresence] = useState<PresenceEntry[]>([]);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const currentWorkflowTaskIdRef = useRef<string | null>(null);
+  /** 已提交反馈的 taskId（多端同步：快照 / 事件 / 轮询 / 本机提交） */
+  const feedbackSubmittedTaskIdsRef = useRef<Set<string>>(new Set());
   const seenArtifactIdsRef = useRef<Set<string>>(new Set());
   /** 用户点「解绑任务」后，忽略 snapshot 里缓存的 activeTaskId，避免立刻把旧 taskId 写回 URL；新任务以 conversation.task_active 为准。 */
   const pauseSnapshotTaskBindRef = useRef(false);
+  /** 仅在 pause=true 时生效：记录被主动解绑/取消的 taskId，避免同一个旧任务被立刻回填。 */
+  const pausedTaskIdRef = useRef<string>("");
   /** 用于在「当前绑定的 taskId」变化时插入分割线；空串表示尚未记录到非空任务。 */
   const prevBoundTaskIdForDividerRef = useRef<string>("");
   /** 本机 onSend 已插入「新任务」分割线时，下一次 taskId 变化由 effect 跳过，避免重复。 */
@@ -167,8 +209,8 @@ export default function Home() {
   const cidFromUrl = searchParams.get("conversationId");
   const conversationId = useMemo(() => {
     const fromUrl = typeof cidFromUrl === "string" ? cidFromUrl.trim() : "";
-    if (fromUrl) return fromUrl;
-    return (process.env.NEXT_PUBLIC_DELIVERY_CHAT_ID ?? "").trim();
+    const fromEnv = (process.env.NEXT_PUBLIC_DELIVERY_CHAT_ID ?? "").trim();
+    return fromUrl || fromEnv || "demo_conversation";
   }, [cidFromUrl]);
   const appendArtifactsToMessages = (
     artifacts: Array<{ artifactId?: string; kind: string; title: string; url: string }>,
@@ -218,6 +260,7 @@ export default function Home() {
 
   const clearBoundTask = () => {
     pauseSnapshotTaskBindRef.current = true;
+    pausedTaskIdRef.current = (currentWorkflowTaskIdRef.current || "").trim();
     prevBoundTaskIdForDividerRef.current = "";
     skipDividerOnNextTaskIdChangeRef.current = false;
     setStartedWorkflowTaskId(null);
@@ -235,6 +278,7 @@ export default function Home() {
   /** 同一页再次发起工作流时先卸下旧 task，避免叠在旧进度上；不暂停 snapshot（马上要绑新 id）。 */
   const detachPreviousTaskBeforeStart = () => {
     pauseSnapshotTaskBindRef.current = false;
+    pausedTaskIdRef.current = "";
     setStartedWorkflowTaskId(null);
     setTasks([]);
     setActiveTaskId(undefined);
@@ -252,16 +296,13 @@ export default function Home() {
     if (effectiveTaskId && realtimeConfigured) joinTask(effectiveTaskId);
   }, [effectiveTaskId, realtimeConfigured]);
 
-  // If the workflow is triggered from Feishu IM (webhook), the GUI may not know the taskId.
-  // In that case, discover latest taskId by configured delivery chatId and auto-subscribe.
-  // This is the fallback path when realtime is not configured; when realtime is up,
-  // `conversation.task_active` push takes over.
+  // If the GUI has no taskId yet, discover the latest non-terminal task for this conversation.
+  // - Without realtime: this is the only way to auto-subscribe.
+  // - With realtime: snapshot / conversation.task_active are primary, but this still runs when
+  //   realtime store lost activeTaskId (e.g. server restart) or events were missed — complements push.
   useEffect(() => {
     if (effectiveTaskId) return;
-    if (realtimeConfigured) return;
     if (!conversationId) return;
-    if (pauseSnapshotTaskBindRef.current) return;
-
     let cancelled = false;
     void (async () => {
       try {
@@ -272,7 +313,14 @@ export default function Home() {
         const payload = (await resp.json()) as { ok: boolean; found?: boolean; taskId?: string };
         const taskId = typeof payload.taskId === "string" ? payload.taskId.trim() : "";
         if (!payload.ok || !payload.found || !taskId) return;
+        if (pauseSnapshotTaskBindRef.current && taskId === pausedTaskIdRef.current) return;
+        const terminal = await isTerminalTask(taskId);
+        if (terminal) return;
         if (cancelled) return;
+        if (pauseSnapshotTaskBindRef.current && taskId !== pausedTaskIdRef.current) {
+          pauseSnapshotTaskBindRef.current = false;
+          pausedTaskIdRef.current = "";
+        }
         setStartedWorkflowTaskId(taskId);
         {
           const next = new URLSearchParams(searchParams.toString());
@@ -299,14 +347,21 @@ export default function Home() {
     const offSnapshot = onConversationSnapshot((p: ConversationSnapshotPayload) => {
       if (p.cid !== conversationId) return;
       setPresence(Array.isArray(p.presence) ? p.presence : []);
-      if (pauseSnapshotTaskBindRef.current) return;
       const tid = typeof p.activeTaskId === "string" ? p.activeTaskId.trim() : "";
-      if (tid && tid !== currentWorkflowTaskIdRef.current) {
+      if (!tid || tid === currentWorkflowTaskIdRef.current) return;
+      if (pauseSnapshotTaskBindRef.current && tid === pausedTaskIdRef.current) return;
+      void (async () => {
+        const terminal = await isTerminalTask(tid);
+        if (terminal) return;
+        if (pauseSnapshotTaskBindRef.current && tid !== pausedTaskIdRef.current) {
+          pauseSnapshotTaskBindRef.current = false;
+          pausedTaskIdRef.current = "";
+        }
         setStartedWorkflowTaskId(tid);
         const next = new URLSearchParams(searchParams.toString());
         next.set("taskId", tid);
         router.replace(`/?${next.toString()}`);
-      }
+      })();
     });
 
     const offActive = onConversationTaskActive((p: ConversationTaskActiveEvent) => {
@@ -315,6 +370,7 @@ export default function Home() {
       if (!tid) return;
       if (tid === currentWorkflowTaskIdRef.current) return;
       pauseSnapshotTaskBindRef.current = false;
+      pausedTaskIdRef.current = "";
       seenArtifactIdsRef.current.clear();
       setSlidesRehearsalUrl("");
       setTasks([]);
@@ -374,11 +430,19 @@ export default function Home() {
         if (!resp.ok) return;
         const payload = (await resp.json()) as {
           ok: boolean;
-          task?: { steps?: Array<{ stepId: string; status: "pending" | "running" | "completed" | "failed" }>; state?: string };
+          task?: {
+            steps?: Array<{ stepId: string; status: "pending" | "running" | "completed" | "failed" }>;
+            state?: string;
+            feedbackSubmitted?: { rating: string; at: number };
+          };
           artifacts?: Array<{ artifactId?: string; kind: string; title: string; url: string }>;
           error?: string | null;
         };
         if (!payload.ok || !payload.task?.steps) return;
+        if (payload.task.feedbackSubmitted && effectiveTaskId) {
+          feedbackSubmittedTaskIdsRef.current.add(effectiveTaskId);
+          setFeedbackEligibleTaskId(undefined);
+        }
         setTasks(payload.task.steps.map((s) => ({ id: s.stepId, title: s.stepId, status: toTaskStatus(s.status) })));
         const slidesArtifact = Array.isArray(payload.artifacts)
           ? payload.artifacts.find((a) => a.kind === "slides" && typeof a.url === "string" && a.url.trim())
@@ -397,8 +461,21 @@ export default function Home() {
         ) {
           setActiveTaskId(undefined);
         }
-        if (payload.task.state === "idle" && effectiveTaskId) {
-          setFeedbackEligibleTaskId(effectiveTaskId);
+        if (isCancelledState(payload.task.state)) {
+          pauseSnapshotTaskBindRef.current = true;
+          pausedTaskIdRef.current = (effectiveTaskId || "").trim();
+          setStartedWorkflowTaskId(null);
+          setTasks([]);
+          setActiveTaskId(undefined);
+          setConfirmRequest(null);
+          setSlidesRehearsalUrl("");
+          setFeedbackEligibleTaskId(undefined);
+          removeTaskIdFromCurrentUrl();
+        }
+        if (payload.task.state === "idle" && effectiveTaskId && !payload.task.feedbackSubmitted) {
+          if (!feedbackSubmittedTaskIdsRef.current.has(effectiveTaskId)) {
+            setFeedbackEligibleTaskId(effectiveTaskId);
+          }
         }
       } finally {
         // noop
@@ -413,10 +490,43 @@ export default function Home() {
     };
   }, [effectiveTaskId, realtimeConfigured]);
 
+  // Hard guard for refresh/back-forward: if URL still carries a cancelled taskId, auto-unbind it.
+  useEffect(() => {
+    if (!effectiveTaskId) return;
+    let aborted = false;
+    void (async () => {
+      try {
+        const resp = await fetch(`/api/agent/workflow/task/${encodeURIComponent(effectiveTaskId)}`, { cache: "no-store" });
+        if (!resp.ok || aborted) return;
+        const payload = (await resp.json()) as { ok?: boolean; task?: { state?: string } };
+        if (!payload?.ok || aborted) return;
+        if (!isCancelledState(payload?.task?.state)) return;
+        pauseSnapshotTaskBindRef.current = true;
+        pausedTaskIdRef.current = (effectiveTaskId || "").trim();
+        setStartedWorkflowTaskId(null);
+        setTasks([]);
+        setActiveTaskId(undefined);
+        setConfirmRequest(null);
+        setSlidesRehearsalUrl("");
+        setFeedbackEligibleTaskId(undefined);
+        removeTaskIdFromCurrentUrl();
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      aborted = true;
+    };
+  }, [effectiveTaskId]);
+
   useEffect(() => {
     if (!realtimeConfigured) return () => {};
     const offTaskSnapshot = onTaskSnapshot((p: TaskSnapshotPayload) => {
       if (!currentWorkflowTaskIdRef.current || p.taskId !== currentWorkflowTaskIdRef.current) return;
+      if (p.feedbackSubmitted) {
+        feedbackSubmittedTaskIdsRef.current.add(p.taskId);
+        setFeedbackEligibleTaskId(undefined);
+      }
       const nextTasks = p.steps.map((s) => ({ id: s.stepId, title: s.label, status: toTaskStatus(s.status) }));
       setTasks(nextTasks);
       appendArtifactsToMessages(
@@ -437,7 +547,18 @@ export default function Home() {
       if (p.state === "completed" || p.state === "failed" || p.state === "cancelled" || p.state === "idle") {
         setConfirmRequest(null);
       }
-      if (p.state === "idle") {
+      if (isCancelledState(p.state)) {
+        pauseSnapshotTaskBindRef.current = true;
+        pausedTaskIdRef.current = (p.taskId || "").trim();
+        setStartedWorkflowTaskId(null);
+        setTasks([]);
+        setActiveTaskId(undefined);
+        setConfirmRequest(null);
+        setSlidesRehearsalUrl("");
+        setFeedbackEligibleTaskId(undefined);
+        removeTaskIdFromCurrentUrl();
+      }
+      if (p.state === "idle" && !feedbackSubmittedTaskIdsRef.current.has(p.taskId)) {
         setFeedbackEligibleTaskId(p.taskId);
       }
       if (p.state === "failed" || p.state === "cancelled") {
@@ -479,6 +600,12 @@ export default function Home() {
       setFeedbackEligibleTaskId(undefined);
     });
 
+    const offTaskFeedbackSubmitted = onTaskFeedbackSubmitted((p: TaskFeedbackSubmittedEvent) => {
+      if (!currentWorkflowTaskIdRef.current || p.taskId !== currentWorkflowTaskIdRef.current) return;
+      feedbackSubmittedTaskIdsRef.current.add(p.taskId);
+      setFeedbackEligibleTaskId(undefined);
+    });
+
     const offTaskConfirm = onTaskConfirmRequired((p: TaskConfirmRequiredEvent) => {
       if (!currentWorkflowTaskIdRef.current || p.taskId !== currentWorkflowTaskIdRef.current) return;
       setConfirmRequest({ taskId: p.taskId, stepId: p.stepId, reason: p.reason });
@@ -497,6 +624,7 @@ export default function Home() {
       offTaskStep();
       offTaskArtifact();
       offTaskError();
+      offTaskFeedbackSubmitted();
       offTaskConfirm();
     };
   }, [realtimeConfigured]);
@@ -510,7 +638,7 @@ export default function Home() {
         taskId: confirmRequest.taskId,
         stepId: confirmRequest.stepId,
         approved: true,
-        override: { dryRun: false, identity: "bot" },
+        override: { dryRun: false, defaultIdentity: "bot" },
       }),
     });
     setConfirmRequest(null);
@@ -564,7 +692,7 @@ export default function Home() {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            conversationId: "demo_conversation",
+            conversationId,
             input: text,
             contextRange: { mode: "recent_messages", limit: 20 },
             targetArtifacts: ["slides"],
@@ -612,19 +740,24 @@ export default function Home() {
         const deliveryChatId = process.env.NEXT_PUBLIC_DELIVERY_CHAT_ID ?? "";
         const workflowDryRun = process.env.NEXT_PUBLIC_WORKFLOW_DRY_RUN !== "false";
         const hasDocRef = /(?:https?:\/\/[^\s"']+\/docx\/[A-Za-z0-9]+)|(?:docx\/[A-Za-z0-9]+)/.test(text);
-        const hasSlidesRef = /(?:https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9]+)|(?:slides\/[A-Za-z0-9]+)/.test(text);
+        const hasSlidesRef = /(?:https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9_-]+)|(?:slides\/[A-Za-z0-9_-]+)/.test(text);
         const targetArtifacts = hasSlidesRef ? ["slides"] : hasDocRef ? ["doc"] : ["doc"];
         const resp = await fetch("/api/agent/workflow/start", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            conversationId: "demo_conversation",
+            conversationId,
             input: text,
             contextRange: { mode: "recent_messages", limit: 20 },
             targetArtifacts,
             delivery: { channel: "im_chat", chatId: deliveryChatId },
             // Use bot for IM ack/delivery by default, but use user identity for docs.create to ensure you can view the doc.
-            execution: { dryRun: workflowDryRun, defaultIdentity: "bot", docIdentity: "user" },
+            execution: {
+              dryRun: workflowDryRun,
+              defaultIdentity: "bot",
+              docIdentity: "user",
+              slidesIdentity: "user",
+            },
           }),
         });
         if (!resp.ok) {
@@ -872,6 +1005,7 @@ export default function Home() {
                               note: feedbackNote,
                             }),
                           });
+                          feedbackSubmittedTaskIdsRef.current.add(tid);
                         } finally {
                           setFeedbackSubmitting(false);
                           setFeedbackNote("");

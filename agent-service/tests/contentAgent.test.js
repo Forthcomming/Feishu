@@ -152,3 +152,27 @@ test("contentAgent: 缺少 rewrittenSlidesPlan 时 PPT 生成应 fail-fast", () 
   );
 });
 
+test("contentAgent: EXPERIENCE_INJECTION_ENABLED 开启时仍可安全降级（无LLM时报同类错误）", async () => {
+  await withEnv(
+    {
+      EXPERIENCE_INJECTION_ENABLED: "true",
+      EXPERIENCE_TOP_K: "3",
+      DOUBAO_API_KEY: null,
+      DOUBAO_ENDPOINT_ID: null,
+      DOUBAO_CONTENT_ENDPOINT_ID: null,
+    },
+    async () => {
+      await assert.rejects(
+        () =>
+          generateContentBundle({
+            text: "请整理成需求文档",
+            contextSummary: "上下文",
+            targetArtifacts: ["doc"],
+            intent: { output_type: "doc", doc_type: "prd", scenario: "review" },
+          }),
+        /LLM is required/i,
+      );
+    },
+  );
+});
+

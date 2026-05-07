@@ -54,6 +54,7 @@ type TaskSnapshot = {
   artifacts: TaskArtifact[];
   lastError?: string;
   confirmRequired?: { stepId: string; reason: string } | null;
+  feedbackSubmitted?: { rating: string; at: number } | null;
   updatedAt: number;
 };
 
@@ -270,13 +271,20 @@ async function main() {
             next.confirmRequired = null;
           }
           if (payload.eventType === "task.step" && payload.step) {
-            // Clear confirm flag once the gated step progresses.
-            if (next.confirmRequired && payload.step.stepId === next.confirmRequired.stepId && payload.step.status !== "pending") {
+            // 仅在确认步骤结束态清除：running 也会触发 step 事件，若误清会导致「需要确认」横幅一闪即逝或状态错乱。
+            const st = payload.step.status;
+            const terminal = st === "completed" || st === "cancelled" || st === "failed";
+            if (next.confirmRequired && payload.step.stepId === next.confirmRequired.stepId && terminal) {
               next.confirmRequired = null;
             }
           }
           if (payload.eventType === "task.state" && (payload.state === "completed" || payload.state === "failed" || payload.state === "cancelled")) {
             next.confirmRequired = null;
+          }
+          if (payload.eventType === "task.feedback_submitted") {
+            const rating = typeof (payload as { rating?: unknown }).rating === "string" ? (payload as { rating: string }).rating : "up";
+            const at = typeof payload.at === "number" ? payload.at : Date.now();
+            next.feedbackSubmitted = { rating, at };
           }
 
           await writeTaskSnapshot(taskId, next);

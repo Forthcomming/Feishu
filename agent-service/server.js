@@ -8,18 +8,27 @@ const { planWorkflow } = require("./src/plannerAgent");
 const {
   buildDocsCreateArgs,
   buildDocsUpdateArgs,
+  buildDocsFetchArgs,
   buildImMessagesListArgs,
   buildImMessagesSendArgs,
   buildSlidesCreateArgs,
   buildSlidesXmlPresentationsGetArgs,
   buildSlidesXmlPresentationSlideDeleteArgs,
+  buildSlidesXmlPresentationSlideGetArgs,
+  buildSlidesXmlPresentationSlideReplaceArgs,
 } = require("./src/larkCliCommands");
 const { runLarkCli, tryParseJson } = require("./src/larkCliRunner");
 const { TaskStore } = require("./src/taskStore");
 const { AgentOrchestrator } = require("./src/orchestrator");
 const { publishFeedbackEvent, buildUserRatingFeedback } = require("./src/feedback");
-const { record: recordWorkflowFeedback, listRecent: listWorkflowFeedbackRecent } = require("./src/feedbackStore");
+const {
+  record: recordWorkflowFeedback,
+  listRecent: listWorkflowFeedbackRecent,
+  listExperienceCards,
+  getMetrics: getFeedbackMetrics,
+} = require("./src/feedbackStore");
 const { buildContextFromLines } = require("./src/contextPipeline");
+const { isAudioMessageType, transcribeFeishuAudioMessage } = require("./src/voiceTranscriber");
 
 const app = express();
 
@@ -37,15 +46,113 @@ function env(name, fallback) {
   return fallback;
 }
 
+function pickDocxRefFromString(s) {
+  const str = String(s || "");
+  const urlMatch = str.match(/https?:\/\/[^\s"']+\/docx\/[A-Za-z0-9]+/);
+  if (urlMatch) return urlMatch[0];
+  const tokenMatch = str.match(/(?:^|[^A-Za-z0-9])docx\/([A-Za-z0-9]+)(?:$|[^A-Za-z0-9])/);
+  if (tokenMatch && tokenMatch[1]) return `docx/${tokenMatch[1]}`;
+  return "";
+}
+
+function pickSlidesRefFromString(s) {
+  const str = String(s || "");
+  const urlMatch = str.match(/https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9_-]+/);
+  if (urlMatch) return urlMatch[0];
+  const tokenMatch = str.match(/(?:^|[^A-Za-z0-9])slides\/([A-Za-z0-9_-]+)(?:$|[^A-Za-z0-9_-])/);
+  if (tokenMatch && tokenMatch[1]) return `slides/${tokenMatch[1]}`;
+  return "";
+}
+
+/** 从飞书富文本 JSON 中抽取可见文案（含超链接的展示文字） */
+function extractPostStylePlainTextFromJson(obj) {
+  const parts = [];
+  function walk(v) {
+    if (!v || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const x of v) walk(x);
+      return;
+    }
+    const tag = v.tag;
+    if ((tag === "text" || tag === "a") && typeof v.text === "string") parts.push(v.text);
+    for (const x of Object.values(v)) walk(x);
+  }
+  walk(obj);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 客户端常把云文档显示成标题，真实 URL 在 JSON 的 href/url 里；递归收集 docx/slides 引用供编排层解析。
+ */
+function collectEmbeddedCloudRefsFromLarkRaw(contentRaw) {
+  const found = [];
+  const seen = new Set();
+  const pushRef = (ref) => {
+    const r = String(ref || "").trim();
+    if (!r || seen.has(r)) return;
+    seen.add(r);
+    found.push(r);
+  };
+  const consider = (chunk) => {
+    const d = pickDocxRefFromString(chunk);
+    if (d) pushRef(d);
+    const sl = pickSlidesRefFromString(chunk);
+    if (sl) pushRef(sl);
+  };
+
+  if (typeof contentRaw !== "string" || !contentRaw.trim()) return found;
+  consider(contentRaw);
+
+  let obj = null;
+  try {
+    obj = JSON.parse(contentRaw);
+  } catch {
+    return found;
+  }
+
+  const stack = [obj];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (cur == null) continue;
+    if (typeof cur === "string") {
+      consider(cur);
+      const mdLinks = cur.match(/\[[^\]]*\]\((https?:\/\/[^\)]+)\)/g);
+      if (mdLinks) {
+        for (const m of mdLinks) {
+          const inner = m.match(/\((https?:\/\/[^\)]+)\)/);
+          if (inner) consider(inner[1]);
+        }
+      }
+      continue;
+    }
+    if (typeof cur !== "object") continue;
+    for (const [k, v] of Object.entries(cur)) {
+      if (typeof v === "string" && (k === "href" || k === "url" || k === "link")) consider(v);
+      stack.push(v);
+    }
+  }
+  return found;
+}
+
 function parseFeishuTextMessageContent(raw) {
   if (typeof raw !== "string") return "";
   try {
     const obj = JSON.parse(raw);
     if (obj && typeof obj.text === "string") return obj.text.trim();
+    const rich = extractPostStylePlainTextFromJson(obj);
+    if (rich) return rich;
     return raw.trim();
   } catch {
     return raw.trim();
   }
+}
+
+/** 将展示文案与内嵌云文档链接合并，供意图/文档定位使用（避免仅显示文档名时丢失 docx URL） */
+function augmentFeishuTextMessageForAgent(contentRaw) {
+  const base = parseFeishuTextMessageContent(contentRaw);
+  const refs = collectEmbeddedCloudRefsFromLarkRaw(contentRaw);
+  if (!refs.length) return base;
+  return base ? `${base}\n${refs.join("\n")}` : refs.join("\n");
 }
 
 function makeDedupe({ ttlMs = 2 * 60_000 } = {}) {
@@ -88,12 +195,17 @@ function looksLikeBotAck(text) {
 function shouldStartWorkflowFromMessage(text) {
   const t = String(text || "").trim();
   if (!t) return false;
+  // Explicit mention should always reach intent layer.
+  if (/(?:^|[\s,，:：])[@＠]\s*feishu(?:\b|(?=\s|$))/i.test(t)) return true;
   // Hard gate: only start workflow when user clearly asks for a deliverable.
   // This prevents “every message triggers a task”.
+  const bridge = "[\\s\\S]{0,20}";
+  const action = "(生成|输出|整理成|写成|形成|做成|做个|做一份|出|出个|出一份)";
   return (
-    /(生成|输出|整理成|写成|形成)\S{0,10}(文档|需求文档|PRD|纪要|会议纪要|方案|技术方案|报告|周报|月报|总结)/.test(t) ||
-    /(生成|输出|整理成|写成|做成)\S{0,10}(PPT|演示稿|幻灯片|slides|deck)/i.test(t) ||
-    /\b(docx|slides)\/[A-Za-z0-9]+/.test(t)
+    new RegExp(`${action}${bridge}(文档|需求文档|PRD|纪要|会议纪要|方案|技术方案|报告|周报|月报|总结)`).test(t) ||
+    new RegExp(`${action}${bridge}(PPT|演示稿|幻灯片|slides|deck)`, "i").test(t) ||
+    /梳理[\s\S]{0,20}(进度|指标|风险)[\s\S]{0,20}(PPT|演示稿|幻灯片|slides|deck)/i.test(t) ||
+    /\b(docx|slides)\/[A-Za-z0-9_-]+/.test(t)
   );
 }
 
@@ -101,17 +213,23 @@ function isNoisyContextLine(text) {
   const t = String(text || "").trim();
   if (!t) return true;
   if (looksLikeBotAck(t)) return true;
-  // Filter delivery links and other auto-generated artifacts from context.
-  if (/https?:\/\/[^\s]+\/slides\/[A-Za-z0-9]+/i.test(t)) return true;
-  if (/https?:\/\/[^\s]+\/docx\/[A-Za-z0-9]+/i.test(t)) return true;
   if (t.includes("规划产物（预览）")) return true;
+  // 仅过滤「整句只有云文档链接/token」的行；若同条还有正文（例如「请改这篇…」+ 链接），保留以便 resolveDocTarget。
+  let stripped = t.replace(/https?:\/\/[^\s"']+\/(?:docx|slides)\/[A-Za-z0-9_-]+/gi, " ");
+  stripped = stripped.replace(/\bdocx\/[A-Za-z0-9_-]+\b/gi, " ");
+  stripped = stripped.replace(/\bslides\/[A-Za-z0-9_-]+\b/gi, " ");
+  stripped = stripped.replace(/\s+/g, " ").trim();
+  if (!stripped) {
+    return /https?:\/\/[^\s"']+\/(?:docx|slides)\/[A-Za-z0-9_-]+/i.test(t) || /\b(?:docx|slides)\/[A-Za-z0-9_-]+\b/i.test(t);
+  }
   return false;
 }
 
-function extractImTextLines(payload) {
+async function extractImTextLines(payload) {
   // Best-effort extraction from lark-cli `im +messages-list --format json` output.
   // Output shapes may vary between cli versions; scan recursively for message-like objects.
   const out = [];
+  const audioTextCache = new Map();
   const seen = new Set();
   const stack = [payload];
   while (stack.length > 0) {
@@ -128,17 +246,26 @@ function extractImTextLines(payload) {
     const obj = cur;
     const messageType = obj.message_type ?? obj.msg_type ?? obj.type;
     const contentRaw = obj.content;
-    if ((messageType === "text" || messageType === "Text") && typeof contentRaw === "string") {
-      const text = parseFeishuTextMessageContent(contentRaw);
-      if (text && !isNoisyContextLine(text)) {
-        const createTimeRaw = obj.create_time ?? obj.createTime ?? obj.ts ?? obj.timestamp;
-        const createTime = typeof createTimeRaw === "string" || typeof createTimeRaw === "number" ? Number(createTimeRaw) : NaN;
-        out.push({
-          text,
-          at: Number.isFinite(createTime) ? createTime : 0,
-          senderType: safeString(obj.sender_type ?? obj.senderType ?? ""),
-        });
+    const createTimeRaw = obj.create_time ?? obj.createTime ?? obj.ts ?? obj.timestamp;
+    const createTime = typeof createTimeRaw === "string" || typeof createTimeRaw === "number" ? Number(createTimeRaw) : NaN;
+    const senderType = safeString(obj.sender_type ?? obj.senderType ?? "");
+    if (
+      (messageType === "text" || messageType === "Text" || messageType === "post" || messageType === "Post") &&
+      typeof contentRaw === "string"
+    ) {
+      const text = augmentFeishuTextMessageForAgent(contentRaw);
+      if (text && !isNoisyContextLine(text)) out.push({ text, at: Number.isFinite(createTime) ? createTime : 0, senderType });
+    } else if (isAudioMessageType(messageType)) {
+      const cacheKey = safeString(obj.message_id ?? obj.messageId ?? obj.file_key ?? obj.fileKey ?? contentRaw);
+      let transcribed = null;
+      if (cacheKey && audioTextCache.has(cacheKey)) {
+        transcribed = audioTextCache.get(cacheKey);
+      } else {
+        transcribed = await transcribeFeishuAudioMessage(obj);
+        if (cacheKey) audioTextCache.set(cacheKey, transcribed);
       }
+      const text = String(transcribed?.text || "").trim();
+      if (text && !isNoisyContextLine(text)) out.push({ text, at: Number.isFinite(createTime) ? createTime : 0, senderType });
     }
 
     for (const v of Object.values(obj)) stack.push(v);
@@ -228,9 +355,12 @@ const orchestrator = new AgentOrchestrator({
   planWorkflow,
   buildDocsCreateArgs,
   buildDocsUpdateArgs,
+  buildDocsFetchArgs,
   buildSlidesCreateArgs,
   buildSlidesXmlPresentationsGetArgs,
   buildSlidesXmlPresentationSlideDeleteArgs,
+  buildSlidesXmlPresentationSlideGetArgs,
+  buildSlidesXmlPresentationSlideReplaceArgs,
   buildImMessagesSendArgs,
   runLarkCli,
   tryParseJson,
@@ -266,7 +396,7 @@ async function fetchRecentImContext({ chatId, identities, limit }) {
     const listResp = await runLarkCli(listArgs, { timeoutMs: 30_000 });
     const parsed = tryParseJson(listResp.stdout);
     if (!parsed.ok) throw new Error("messages-list returned non-json");
-    const lines = extractImTextLines(parsed.value);
+    const lines = await extractImTextLines(parsed.value);
     return { ok: true, as, lines, omitAsFlag: Boolean(omitAsFlag) };
   };
 
@@ -338,9 +468,18 @@ app.post("/api/feishu/events", (req, res) => {
       // Avoid self-triggering loops: only process user messages.
       if (senderType !== "user") return;
 
-      // Only handle text for Phase 1.
-      if (messageType !== "text") return;
-      const text = parseFeishuTextMessageContent(contentRaw);
+      const supportsText =
+        messageType === "text" || messageType === "Text" || messageType === "post" || messageType === "Post";
+      const supportsAudio = isAudioMessageType(messageType);
+      if (!supportsText && !supportsAudio) return;
+
+      let text = "";
+      if (supportsText) {
+        text = augmentFeishuTextMessageForAgent(typeof contentRaw === "string" ? contentRaw : "");
+      } else {
+        const transcribed = await transcribeFeishuAudioMessage(message);
+        text = String(transcribed?.text || "").trim();
+      }
       if (!text) return;
       if (looksLikeBotAck(text)) return;
       if (!shouldStartWorkflowFromMessage(text)) return;
@@ -357,7 +496,7 @@ app.post("/api/feishu/events", (req, res) => {
         const listResp = await runLarkCli(listArgs, { timeoutMs: 30_000 });
         const parsed = tryParseJson(listResp.stdout);
         if (parsed.ok) {
-          const lines = extractImTextLines(parsed.value);
+          const lines = await extractImTextLines(parsed.value);
           const bundle = buildContextFromLines(lines, text);
           recentMessages = bundle.topMessages;
           contextSummary = bundle.structuredContext;
@@ -393,6 +532,8 @@ app.post("/api/feishu/events", (req, res) => {
       }
 
       try {
+        const slotDoc = intent?.slots?.basedOnDocUrl;
+        const slotSlides = intent?.slots?.basedOnSlidesUrl;
         const task = await orchestrator.startWorkflow({
           taskId,
           conversationId: chatId,
@@ -401,6 +542,8 @@ app.post("/api/feishu/events", (req, res) => {
           recentMessages,
           contextRange: { mode: "recent_messages", limit: 20 },
           targetArtifacts: Array.isArray(intent?.slots?.targetArtifacts) ? intent.slots.targetArtifacts : ["doc"],
+          docTarget: typeof slotDoc === "string" ? slotDoc.trim() : "",
+          slidesTarget: typeof slotSlides === "string" ? slotSlides.trim() : "",
           delivery: { channel: "im_chat", chatId },
           execution: { dryRun, defaultIdentity, docIdentity: "user", slidesIdentity: "user" },
           intentMeta: buildIntentMetaFromAnalyze(intent),
@@ -573,6 +716,7 @@ app.post("/api/agent/workflow/start", async (req, res) => {
 
     const taskId = getId("task");
     const explicitArtifacts = Array.isArray(body.targetArtifacts) ? body.targetArtifacts : null;
+    const bodyDocTarget = typeof body.docTarget === "string" ? body.docTarget.trim() : "";
     const resolvedIntent = explicitArtifacts
       ? null
       : await analyzeIntent({
@@ -586,6 +730,13 @@ app.post("/api/agent/workflow/start", async (req, res) => {
       : resolvedIntent?.parseIntentV2?.output_type === "ppt"
         ? ["slides"]
         : ["doc"];
+    const slotDoc = resolvedIntent?.slots?.basedOnDocUrl;
+    const slotSlides = resolvedIntent?.slots?.basedOnSlidesUrl;
+    const bodySlidesTarget = typeof body.slidesTarget === "string" ? body.slidesTarget.trim() : "";
+    const mergedDocTarget =
+      bodyDocTarget || (typeof slotDoc === "string" ? slotDoc.trim() : "");
+    const mergedSlidesTarget =
+      bodySlidesTarget || (typeof slotSlides === "string" ? slotSlides.trim() : "");
     const task = await orchestrator.startWorkflow({
       taskId,
       conversationId,
@@ -594,6 +745,8 @@ app.post("/api/agent/workflow/start", async (req, res) => {
       recentMessages,
       contextRange,
       targetArtifacts: explicitArtifacts || inferredArtifacts,
+      docTarget: mergedDocTarget,
+      slidesTarget: mergedSlidesTarget,
       delivery,
       execution,
       intentMeta: buildIntentMetaFromAnalyze(resolvedIntent),
@@ -715,6 +868,17 @@ app.post("/api/agent/feedback/rating", async (req, res) => {
       tags: Array.isArray(body.tags) ? body.tags : [],
     });
     void publishFeedbackEvent(event);
+    const at = Date.now();
+    if (taskStore.get(taskId)) {
+      taskStore.update(taskId, { feedbackSubmitted: { rating: ratingRaw, at } });
+    }
+    void publishTaskEvent({
+      eventType: "task.feedback_submitted",
+      taskId,
+      conversationId: conversationId || undefined,
+      rating: ratingRaw,
+      at,
+    });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e && e.message ? e.message : String(e) });
@@ -761,6 +925,9 @@ app.get("/api/agent/workflow/:taskId", (req, res) => {
       state: task.state,
       currentStepId: task.currentStepId || null,
       steps: task.steps,
+      ...(task.feedbackSubmitted && typeof task.feedbackSubmitted === "object"
+        ? { feedbackSubmitted: task.feedbackSubmitted }
+        : {}),
     },
     artifacts: task.artifacts,
     error: task.lastError || null,
@@ -788,6 +955,19 @@ app.post("/api/agent/workflow/feedback", (req, res) => {
 app.get("/api/agent/workflow/feedback/recent", (req, res) => {
   const lim = req.query && req.query.limit != null ? Number(req.query.limit) : 20;
   res.json({ ok: true, items: listWorkflowFeedbackRecent(lim) });
+});
+
+app.get("/api/agent/experience/recent", (req, res) => {
+  const lim = req.query && req.query.limit != null ? Number(req.query.limit) : 20;
+  const conversationId = typeof req.query?.conversationId === "string" ? req.query.conversationId.trim() : "";
+  const scopeRaw = typeof req.query?.scope === "string" ? req.query.scope.trim() : "";
+  const scope = scopeRaw === "tenant" || scopeRaw === "global" ? scopeRaw : "conversation";
+  res.json({
+    ok: true,
+    scope,
+    items: listExperienceCards({ scope, conversationId, limit: lim }),
+    metrics: getFeedbackMetrics(),
+  });
 });
 
 app.get("/api/agent/conversation/:conversationId/latest-task", (req, res) => {
@@ -884,8 +1064,17 @@ app.post("/api/lark-cli/slides/create", async (req, res) => {
   }
 });
 
-const port = process.env.PORT ? Number(process.env.PORT) : 3001;
-app.listen(port, () => {
-  console.log(`agent-service listening on http://localhost:${port}`);
-});
+if (require.main === module) {
+  const port = process.env.PORT ? Number(process.env.PORT) : 3001;
+  app.listen(port, () => {
+    console.log(`agent-service listening on http://localhost:${port}`);
+  });
+}
+
+module.exports = {
+  app,
+  extractImTextLines,
+  augmentFeishuTextMessageForAgent,
+  collectEmbeddedCloudRefsFromLarkRaw,
+};
 

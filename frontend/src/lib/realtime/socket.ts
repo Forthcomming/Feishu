@@ -76,6 +76,7 @@ export type TaskSnapshotPayload = {
   artifacts: Array<{ artifactId: string; kind: string; title: string; url: string }>;
   lastError?: string;
   confirmRequired?: { stepId: string; reason: string } | null;
+  feedbackSubmitted?: { rating: string; at: number } | null;
   updatedAt: number;
 };
 
@@ -104,6 +105,14 @@ export type TaskConfirmResolvedEvent = {
   taskId: string;
   stepId: string;
   approved: boolean;
+  at: number;
+};
+
+export type TaskFeedbackSubmittedEvent = {
+  eventType: "task.feedback_submitted";
+  taskId: string;
+  conversationId?: string;
+  rating: string;
   at: number;
 };
 
@@ -296,6 +305,13 @@ export function onTaskConfirmResolved(handler: (p: TaskConfirmResolvedEvent) => 
   if (!s) return () => {};
   s.on("task.confirm_resolved", handler);
   return () => s.off("task.confirm_resolved", handler);
+}
+
+export function onTaskFeedbackSubmitted(handler: (p: TaskFeedbackSubmittedEvent) => void) {
+  const s = getSocket();
+  if (!s) return () => {};
+  s.on("task.feedback_submitted", handler);
+  return () => s.off("task.feedback_submitted", handler);
 }
 
 export function onBlocksUpdate(handler: (p: BlocksUpdatePayload) => void) {

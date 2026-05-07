@@ -4,7 +4,7 @@ const PPT_TYPES = ["review", "report", "proposal"];
 const SCENARIOS = ["discussion", "review", "handoff", "brainstorm"];
 const FALLBACK_DOC_TYPE = "meeting_summary";
 
-const RE_SLIDES_URL = /https?:\/\/[^\s]+\/slides\/[A-Za-z0-9]+/;
+const RE_SLIDES_URL = /https?:\/\/[^\s"']+\/slides\/[A-Za-z0-9_-]+/;
 const RE_EXPLICIT_PPT = /(ppt|演示稿|幻灯片|slides|deck)/i;
 const RE_NEGATED_PPT = /(不要|不需要|别(做|搞|生成)?|不是).{0,6}(ppt|幻灯片|演示稿|slides|deck)/i;
 const RE_DOC_SUBTYPE_HIT =

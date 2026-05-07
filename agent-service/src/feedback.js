@@ -3,6 +3,10 @@
 // Stability: events are versioned via `v`; schema must stay backward-compatible.
 
 const FEEDBACK_SCHEMA_VERSION = 1;
+const {
+  recordFeedbackEvent,
+  incrementMetric,
+} = require("./feedbackStore");
 
 function envOptional(name) {
   const v = process.env[name];
@@ -21,13 +25,17 @@ function clampNote(value, max = 500) {
 
 async function publishFeedbackEvent(event) {
   const url = envOptional("REALTIME_FEEDBACK_PUBLISH_URL") || "http://localhost:3003/api/feedback-events";
+  // Keep a local lightweight copy for reflect job / debug.
+  recordFeedbackEvent(event);
   try {
     await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json; charset=utf-8" },
       body: JSON.stringify(event),
     });
+    incrementMetric("feedback_publish_success_total", 1);
   } catch {
+    incrementMetric("feedback_publish_fail_total", 1);
     // Realtime 不可用时不阻断主流程
   }
 }

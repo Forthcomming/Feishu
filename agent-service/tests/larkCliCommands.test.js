@@ -1,7 +1,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { buildDocsCreateArgs, buildDocsUpdateArgs, buildImMessagesSendArgs, buildSlidesCreateArgs } = require("../src/larkCliCommands");
+const {
+  buildDocsCreateArgs,
+  buildDocsUpdateArgs,
+  buildDocsFetchArgs,
+  buildImMessagesSendArgs,
+  buildSlidesCreateArgs,
+} = require("../src/larkCliCommands");
 
 test("buildImMessagesSendArgs: default dry-run + bot identity", () => {
   const args = buildImMessagesSendArgs({ chatId: "oc_xxx", text: "Hello" });
@@ -40,7 +46,7 @@ test("buildDocsCreateArgs: apiVersion v1 uses --title + --markdown", () => {
   assert.ok(!args.includes("--content"));
 });
 
-test("buildDocsUpdateArgs: apiVersion v2 + append mode uses --doc + --markdown", () => {
+test("buildDocsUpdateArgs: apiVersion v2 + append mode uses --doc + stdin content", () => {
   const args = buildDocsUpdateArgs({
     as: "user",
     doc: "https://example.com/docx/abc",
@@ -59,6 +65,58 @@ test("buildDocsUpdateArgs: apiVersion v2 + append mode uses --doc + --markdown",
   assert.ok(args.includes("--content"));
   assert.ok(args.includes("-"));
   assert.ok(!args.includes("--dry-run"));
+});
+
+test("buildDocsUpdateArgs: v2 block_replace includes block-id and markdown format", () => {
+  const args = buildDocsUpdateArgs({
+    as: "user",
+    doc: "docx/abc",
+    markdown: "新文案",
+    command: "block_replace",
+    blockId: "blkcn_1",
+    docFormat: "markdown",
+    apiVersion: "v2",
+    dryRun: false,
+  });
+  assert.ok(args.includes("block_replace"));
+  assert.ok(args.includes("--block-id"));
+  assert.ok(args.includes("blkcn_1"));
+  assert.ok(args.includes("markdown"));
+});
+
+test("buildDocsUpdateArgs: block_delete has block-id and no content flag", () => {
+  const args = buildDocsUpdateArgs({
+    as: "user",
+    doc: "docx/abc",
+    markdown: "",
+    command: "block_delete",
+    blockId: "blkcn_test123",
+    apiVersion: "v2",
+    dryRun: true,
+  });
+  assert.ok(args.includes("block_delete"));
+  assert.ok(args.includes("blkcn_test123"));
+  assert.ok(!args.includes("--content"));
+});
+
+test("buildDocsFetchArgs: keyword scope + with-ids（须配合 xml，与 lark-cli 校验一致）", () => {
+  const args = buildDocsFetchArgs({
+    as: "user",
+    doc: "https://example.com/docx/abc",
+    apiVersion: "v2",
+    detail: "with-ids",
+    scope: "keyword",
+    keyword: "里程碑",
+    docFormat: "xml",
+    dryRun: false,
+  });
+  assert.deepEqual(args.slice(0, 3), ["docs", "+fetch", "--as"]);
+  assert.ok(args.includes("--detail"));
+  assert.ok(args.includes("with-ids"));
+  assert.ok(args.includes("--scope"));
+  assert.ok(args.includes("keyword"));
+  assert.ok(args.includes("里程碑"));
+  assert.ok(args.includes("xml"));
 });
 
 test("buildSlidesCreateArgs: 支持传入 slidesXmlArray", () => {

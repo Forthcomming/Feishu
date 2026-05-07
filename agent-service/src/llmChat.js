@@ -27,10 +27,12 @@ function buildConfig({ purpose }) {
   if (provider === "doubao") {
     const apiKey = envOptional("DOUBAO_API_KEY");
     const baseUrl = envOptional("DOUBAO_BASE_URL") ?? "https://ark.cn-beijing.volces.com/api/v3";
-    const model =
-      purpose === "content"
-        ? envOptional("DOUBAO_CONTENT_ENDPOINT_ID") ?? envOptional("DOUBAO_ENDPOINT_ID")
-        : envOptional("DOUBAO_ENDPOINT_ID");
+    let model = envOptional("DOUBAO_ENDPOINT_ID");
+    if (purpose === "content") {
+      model = envOptional("DOUBAO_CONTENT_ENDPOINT_ID") ?? envOptional("DOUBAO_ENDPOINT_ID");
+    } else if (purpose === "edit_intent") {
+      model = envOptional("DOUBAO_EDIT_INTENT_ENDPOINT_ID") ?? envOptional("DOUBAO_ENDPOINT_ID");
+    }
     if (!apiKey || !model) throw new Error("LLM is required: missing DOUBAO_API_KEY or DOUBAO_ENDPOINT_ID");
     return { provider, apiKey, baseUrl, model };
   }
@@ -38,7 +40,10 @@ function buildConfig({ purpose }) {
   if (provider === "deepseek") {
     const apiKey = envOptional("DEEPSEEK_API_KEY");
     const baseUrl = envOptional("DEEPSEEK_BASE_URL") ?? "https://api.deepseek.com";
-    const model = envOptional("DEEPSEEK_MODEL") ?? "deepseek-v4-flash";
+    let model = envOptional("DEEPSEEK_MODEL") ?? "deepseek-v4-flash";
+    if (purpose === "edit_intent") {
+      model = envOptional("DEEPSEEK_EDIT_INTENT_MODEL") ?? model;
+    }
     if (!apiKey) throw new Error("LLM is required: missing DEEPSEEK_API_KEY");
     return { provider, apiKey, baseUrl, model };
   }

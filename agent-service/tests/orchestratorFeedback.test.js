@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const { AgentOrchestrator } = require("../src/orchestrator");
 const { TaskStore } = require("../src/taskStore");
+const { resolveEditIntentRuleOnly } = require("./orchestratorResolveRule");
 
 function makeMinimalDeps({ feedbackEvents }) {
   return {
@@ -25,6 +26,7 @@ function makeMinimalDeps({ feedbackEvents }) {
     publishFeedbackEvent: async (evt) => {
       feedbackEvents.push(evt);
     },
+    resolveEditIntent: resolveEditIntentRuleOnly,
   };
 }
 
@@ -106,4 +108,62 @@ test("orchestrator: publishFeedbackEvent 抛错不会阻断主流程", async () 
 
   const t = deps.taskStore.get(taskId);
   assert.equal(t.state, "cancelled");
+});
+
+test("orchestrator: completed 后进入 reflecting 时触发 reflectJob（失败不阻断）", async () => {
+  const feedbackEvents = [];
+  const deps = makeMinimalDeps({ feedbackEvents });
+  let reflectCalls = 0;
+  deps.parseIntent = () => ({ output_type: "doc", doc_type: "meeting_summary", ppt_type: "report", scenario: "discussion" });
+  deps.planWorkflow = async () => ({
+    planVersion: 1,
+    steps: [{ stepId: "step_make_outline", label: "生成大纲", status: "pending" }],
+    tasks: [],
+    risks: { needsConfirm: false, reason: "" },
+  });
+  deps.generateContentBundle = async () => ({
+    summaryMd: "## 上下文摘要\n- x",
+    requirementsMd: "## 需求\n- x",
+    clarifyMd: "## 澄清\n- x",
+    outlineMd: "## 大纲\n- x",
+    confidence: 0.9,
+  });
+  deps.runReflectJob = async () => {
+    reflectCalls += 1;
+    throw new Error("reflect failed");
+  };
+  const orch = new AgentOrchestrator(deps);
+  const taskId = "task_reflect_trigger";
+  deps.taskStore.create({
+    taskId,
+    conversationId: "conv_reflect",
+    state: "detecting",
+    currentStepId: null,
+    steps: [{ stepId: "step_extract_intent", label: "提取意图", status: "pending" }],
+    artifacts: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    lastError: null,
+  });
+
+  const prevReflectMs = process.env.REFLECTING_PHASE_MS;
+  process.env.REFLECTING_PHASE_MS = "0";
+  try {
+    await orch.runWorkflow(taskId, {
+      taskId,
+      conversationId: "conv_reflect",
+      input: "请整理成文档",
+      contextSummary: "",
+      targetArtifacts: ["doc"],
+      delivery: { channel: "im_chat", chatId: "" },
+      execution: { dryRun: true },
+    });
+  } finally {
+    if (prevReflectMs == null) delete process.env.REFLECTING_PHASE_MS;
+    else process.env.REFLECTING_PHASE_MS = prevReflectMs;
+  }
+
+  assert.equal(reflectCalls, 1);
+  const t = deps.taskStore.get(taskId);
+  assert.equal(t.state, "idle");
 });

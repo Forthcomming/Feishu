@@ -98,9 +98,21 @@ function runLarkCli(args, { timeoutMs = 30_000, stdin = null } = {}) {
 }
 
 function tryParseJson(text) {
+  const t = String(text || "").trim();
+  if (!t) return { ok: false, value: null };
   try {
-    return { ok: true, value: JSON.parse(text) };
+    return { ok: true, value: JSON.parse(t) };
   } catch {
+    // lark-cli 常在 JSON 前输出日志；xml_presentations get 也可能仅中间一段为对象
+    const start = t.indexOf("{");
+    const end = t.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        return { ok: true, value: JSON.parse(t.slice(start, end + 1)) };
+      } catch {
+        return { ok: false, value: null };
+      }
+    }
     return { ok: false, value: null };
   }
 }

@@ -7,6 +7,8 @@ const { resolveDocTemplate, resolveSlidesTemplate } = require("./intentTemplates
 const { buildSlideXml, slideRoleForIndex } = require("./slideTemplates");
 const { restructureContent, evaluateDocQuality } = require("./contentRestructure");
 const { callChatCompletions } = require("./llmChat");
+const { retrieveExperienceCards } = require("./experienceRetriever");
+const { renderExperienceInjection } = require("./experienceInject");
 
 function clamp01(n) {
   if (!Number.isFinite(n)) return 0;
@@ -163,13 +165,19 @@ function evaluateSlidesPlanQuality(plan) {
   const genericTitleRe = /^(概览|总结|要点|核心要点|结论|背景|方案|风险|下一步|计划)\s*$/;
   const allBullets = [];
 
-  for (const s of slides) {
+  for (let i = 0; i < slides.length; i += 1) {
+    const s = slides[i];
     const title = normalizeSlideText(s?.title);
     if (!title) reasons.push("empty_title");
     if (title && genericTitleRe.test(title)) reasons.push("generic_title");
 
     const bulletsArr = Array.isArray(s?.bullets) ? s.bullets.map(normalizeSlideText).filter(Boolean) : [];
-    if (bulletsArr.length < 3 || bulletsArr.length > 5) reasons.push("bullets_count_out_of_range");
+    const isCover = i === 0;
+    // Prompt contract: non-cover slides must keep 3-5 bullets.
+    // Cover slide is title-first and can be lighter.
+    const minBullets = isCover ? 1 : 3;
+    const maxBullets = 5;
+    if (bulletsArr.length < minBullets || bulletsArr.length > maxBullets) reasons.push("bullets_count_out_of_range");
     allBullets.push(...bulletsArr);
   }
 
@@ -361,7 +369,7 @@ async function callDoubaoRewriteDoc({
   return { rewrittenMd, confidence };
 }
 
-async function generateContentBundle({ text, contextSummary, targetArtifacts, intent }) {
+async function generateContentBundle({ text, contextSummary, targetArtifacts, intent, experienceContext }) {
   const wantsDoc = Array.isArray(targetArtifacts) && targetArtifacts.includes("doc");
   const wantsSlides = Array.isArray(targetArtifacts) && targetArtifacts.includes("slides");
   const timeoutMs = Number(envOptional("CONTENT_TIMEOUT_MS") ?? "8000");
@@ -391,6 +399,17 @@ async function generateContentBundle({ text, contextSummary, targetArtifacts, in
     throw new Error("LLM is required: missing DOUBAO_API_KEY/DEEPSEEK_API_KEY");
   }
 
+  let experienceInjectBlock = "";
+  try {
+    const cards = await retrieveExperienceCards({
+      conversationId: experienceContext?.conversationId || "",
+      intent,
+    });
+    experienceInjectBlock = renderExperienceInjection(cards);
+  } catch {
+    // 经验检索失败不阻断主流程
+  }
+
   const system = [
     "你是一个办公协同助手的内容生成器。",
     "目标：根据用户指令与上下文，生成 4 段 markdown：上下文摘要、需求点抽取、待确认问题清单、结构大纲。",
@@ -408,6 +427,7 @@ async function generateContentBundle({ text, contextSummary, targetArtifacts, in
     `用户指令：${String(text || "").trim()}`,
     `上下文摘要：${String(contextSummary || "").trim()}`,
     `目标产物：doc=${wantsDoc ? "true" : "false"} slides=${wantsSlides ? "true" : "false"}`,
+    experienceInjectBlock ? `\n${experienceInjectBlock}` : "",
   ].join("\n");
 
   const content = await callLlm({ system, user, timeoutMs, temperature: 0.2, purpose: "content" });
